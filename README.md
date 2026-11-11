@@ -1,4 +1,29 @@
 # MPComm - Multiparty Communication
+
+## Execução local com Docker
+Requer Docker e Docker Compose v2. Sobe 1 GroupMngr, 1 comparisonServer e N peers
+(`N_PEERS`, padrão 6) numa rede bridge local. Os logs dos peers aparecem em `./logs`.
+
+Modo automático (teste rápido; `AUTO_ROUNDS` aceita uma lista, ex.: `20,50`):
+```bash
+rm -rf logs && mkdir logs
+AUTO_ROUNDS=20 timeout 180 docker compose up --build --exit-code-from comparison
+echo "código de saída: $?"
+for f in logs/logfile*.log; do python3 -c "import ast,sys; print(sys.argv[1], len(ast.literal_eval(open(sys.argv[1]).read())))" "$f"; done
+docker compose down
+```
+
+Modo interativo (como no original):
+```bash
+docker compose up --build -d groupmngr peer
+docker compose run --rm --use-aliases comparison
+# digite 20; depois 0 para encerrar
+docker compose down
+```
+
+Para outro número de peers: `N_PEERS=8 AUTO_ROUNDS=20 docker compose up --build --exit-code-from comparison`.
+Em rede local o número de "unordered message rounds" costuma ser 0 ou baixo; isso é esperado.
+
 Very simple demo of multicast communication without coordination. The intent is to demonstrate how things can go wrong as we scale a distributed system (in this case, scaling in the geographical dimension) without taking appropriate measures to coordinate the behavior of its components. Later, this example will serve as the basis to implement coordination protocols, notably for message ordering, as part of course assignments.
 
 ## Overall structure

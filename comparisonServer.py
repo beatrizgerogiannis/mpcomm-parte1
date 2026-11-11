@@ -3,6 +3,15 @@ import pickle
 from constMP import *
 import time
 import sys
+import os
+
+# Automatic mode (e.g., Docker Compose): AUTO_ROUNDS="20" or "20,50" replaces input().
+# Unset or empty means interactive mode, as in the original.
+autoRounds = None
+if os.environ.get('AUTO_ROUNDS', '').strip():
+	autoRounds = [int(x) for x in os.environ['AUTO_ROUNDS'].split(',')]
+	if any(n <= 0 for n in autoRounds):
+		sys.exit('ERROR: AUTO_ROUNDS must contain only positive integers (e.g., "20" or "20,50")')
 
 serverSock = socket(AF_INET, SOCK_STREAM)
 # Allow immediate reuse of the port after closing
@@ -41,8 +50,38 @@ def mainLoop():
 			break
 
 def promptUser():
-	nMsgs = int(input('Enter the number of messages for each peer to send (0 to terminate)=> '))
+	if autoRounds is None:
+		nMsgs = int(input('Enter the number of messages for each peer to send (0 to terminate)=> '))
+		return nMsgs
+	if not autoRounds:
+		# Last round done: exit without telling peers/group manager to stop
+		print('AUTO_ROUNDS: all rounds done. Exiting.')
+		sys.exit(0)
+	nMsgs = autoRounds.pop(0)
+	print('AUTO_ROUNDS: next round with ' + str(nMsgs) + ' messages per peer')
+	waitForPeers()
 	return nMsgs
+
+def waitForPeers(timeout=60):
+	# Poll the group manager until N peers are registered
+	deadline = time.time() + timeout
+	peerList = []
+	while True:
+		clientSock = socket(AF_INET, SOCK_STREAM)
+		try:
+			clientSock.connect((GROUPMNGR_ADDR,GROUPMNGR_TCP_PORT))
+			clientSock.send(pickle.dumps({"op":"list"}))
+			peerList = pickle.loads(clientSock.recv(2048))
+		except (OSError, EOFError) as e:
+			print('Group manager not available: ', e)
+		finally:
+			clientSock.close()
+		if len(peerList) >= N:
+			return
+		if time.time() >= deadline:
+			sys.exit('ERROR: timeout (' + str(timeout) + ' s) waiting for ' + str(N) +
+				' peers to register; group manager has ' + str(len(peerList)))
+		time.sleep(0.5)
 
 def startPeers(peerList,nMsgs):
 	# Connect to each of the peers and send the 'initiate' signal:

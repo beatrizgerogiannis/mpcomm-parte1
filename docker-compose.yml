@@ -1,0 +1,43 @@
+# Local run: 1 group manager + 1 comparison server + N peers (N_PEERS, default 6)
+x-common-env: &common-env
+  SERVER_ADDR: comparison
+  GROUPMNGR_ADDR: groupmngr
+  N_PEERS: ${N_PEERS:-6}
+
+networks:
+  mpcomm:
+    driver: bridge
+
+services:
+  groupmngr:
+    build: .
+    command: python GroupMngr.py
+    environment: *common-env
+    networks: [mpcomm]
+
+  comparison:
+    build: .
+    command: python comparisonServer.py
+    stdin_open: true
+    tty: true
+    environment:
+      <<: *common-env
+      AUTO_ROUNDS: ${AUTO_ROUNDS:-}
+    depends_on: [groupmngr]
+    networks: [mpcomm]
+
+  peer:
+    build: .
+    command: python /app/peerCommunicatorUDP.py
+    # Logs (logfile<ID>.log) are written to the working dir, mounted from the host
+    working_dir: /app/logs
+    volumes:
+      - ./logs:/app/logs
+    environment:
+      <<: *common-env
+      PEER_IP_MODE: local
+    cap_add: [NET_ADMIN]
+    depends_on: [groupmngr]
+    deploy:
+      replicas: ${N_PEERS:-6}
+    networks: [mpcomm]

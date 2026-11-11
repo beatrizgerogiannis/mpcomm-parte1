@@ -4,6 +4,7 @@ import threading
 import random
 import time
 import pickle
+import os
 from requests import get
 
 #handShakes = [] # not used; only if we need to check whose handshake is missing
@@ -31,15 +32,30 @@ serverSock.listen(1)
 
 
 def get_public_ip():
+  # PEER_IP_MODE=local: use the container/host IP instead of the public one (local runs)
+  if os.environ.get('PEER_IP_MODE', 'public') == 'local':
+    ipAddr = gethostbyname(gethostname())
+    print('My local IP address is: {}'.format(ipAddr))
+    return ipAddr
   ipAddr = get('https://api.ipify.org').content.decode('utf8')
   print('My public IP address is: {}'.format(ipAddr))
   return ipAddr
 
 # Function to register this peer with the group manager
 def registerWithGroupManager():
-  clientSock = socket(AF_INET, SOCK_STREAM)
   print ('Connecting to group manager: ', (GROUPMNGR_ADDR,GROUPMNGR_TCP_PORT))
-  clientSock.connect((GROUPMNGR_ADDR,GROUPMNGR_TCP_PORT))
+  # Retry: the group manager may not be up yet (e.g., when started by Docker Compose)
+  for attempt in range(1, 21):
+    clientSock = socket(AF_INET, SOCK_STREAM)
+    try:
+      clientSock.connect((GROUPMNGR_ADDR,GROUPMNGR_TCP_PORT))
+      break
+    except OSError as e:
+      clientSock.close()
+      print('Group manager not available (attempt ' + str(attempt) + '/20): ', e)
+      if attempt == 20:
+        raise
+      time.sleep(0.5)
   ipAddr = get_public_ip()
   req = {"op":"register", "ipaddr":ipAddr, "port":PEER_UDP_PORT}
   msg = pickle.dumps(req)
