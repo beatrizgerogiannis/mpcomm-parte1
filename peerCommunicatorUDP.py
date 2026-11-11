@@ -9,8 +9,8 @@ from requests import get
 
 #handShakes = [] # not used; only if we need to check whose handshake is missing
 
-# Counter to make sure we have received handshakes from all other processes
-handShakeCount = 0
+# Set by the handler thread when its handShakeCount reaches N (recreated every round)
+allHandshakesReceived = threading.Event()
 
 PEERS = []
 
@@ -78,21 +78,23 @@ def getListOfPeers():
   return PEERS
 
 class MsgHandler(threading.Thread):
-  def __init__(self, sock):
+  def __init__(self, sock, myself):
     threading.Thread.__init__(self)
     self.sock = sock
+    self.myself = myself
+    # Counter to make sure we have received handshakes from all other processes
+    self.handShakeCount = 0
 
   def run(self):
     print('Handler is ready. Waiting for the handshakes...')
     
     #global handShakes
-    global handShakeCount
     
     logList = []
     
     # Wait until handshakes are received from all other processes
     # (to make sure that all processes are synchronized before they start exchanging messages)
-    while handShakeCount < N:
+    while self.handShakeCount < N:
       msgPack = self.sock.recv(1024)
       msg = pickle.loads(msgPack)
       #print ('########## unpickled msgPack: ', msg)
@@ -100,9 +102,11 @@ class MsgHandler(threading.Thread):
 
         # To do: send reply of handshake and wait for confirmation
 
-        handShakeCount = handShakeCount + 1
+        self.handShakeCount = self.handShakeCount + 1
         #handShakes[msg[1]] = 1
         print('--- Handshake received: ', msg[1])
+        if self.handShakeCount == N:
+          allHandshakesReceived.set()
 
     print('Secondary Thread: Received all handshakes. Entering the loop to receive messages.')
 
@@ -119,7 +123,7 @@ class MsgHandler(threading.Thread):
         logList.append(msg)
         
     # Write log file
-    logFile = open('logfile'+str(myself)+'.log', 'w')
+    logFile = open('logfile'+str(self.myself)+'.log', 'w')
     logFile.writelines(str(logList))
     logFile.close()
     
@@ -130,9 +134,6 @@ class MsgHandler(threading.Thread):
     msgPack = pickle.dumps(logList)
     clientSock.send(msgPack)
     clientSock.close()
-    
-    # Reset the handshake counter
-    handShakeCount = 0
 
     exit(0)
 
@@ -158,8 +159,11 @@ while 1:
     print('Terminating.')
     exit(0)
 
+  # New event for this round (the previous one is already set)
+  allHandshakesReceived = threading.Event()
+
   # Create receiving message handler
-  msgHandler = MsgHandler(recvSocket)
+  msgHandler = MsgHandler(recvSocket, myself)
   msgHandler.start()
   print('Handler started')
 
@@ -175,10 +179,10 @@ while 1:
     sendSocket.sendto(msgPack, (addrToSend,PEER_UDP_PORT))
     #data = recvSocket.recvfrom(128) # Handshadke confirmations have not yet been implemented
 
-  print('Main Thread: Sent all handshakes. handShakeCount=', str(handShakeCount))
+  print('Main Thread: Sent all handshakes. handShakeCount=', str(msgHandler.handShakeCount))
 
-  while (handShakeCount < N):
-    pass  # find a better way to wait for the handshakes
+  # Block until the handler thread has received all handshakes
+  allHandshakesReceived.wait()
 
   # Send a sequence of data messages to all other processes 
   for msgNumber in range(0, nMsgs):
