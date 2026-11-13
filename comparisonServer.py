@@ -13,12 +13,6 @@ if os.environ.get('AUTO_ROUNDS', '').strip():
 	if any(n <= 0 for n in autoRounds):
 		sys.exit('ERROR: AUTO_ROUNDS must contain only positive integers (e.g., "20" or "20,50")')
 
-serverSock = socket(AF_INET, SOCK_STREAM)
-# Allow immediate reuse of the port after closing
-serverSock.setsockopt(SOL_SOCKET, SO_REUSEADDR, 1)
-serverSock.bind(('0.0.0.0', SERVER_PORT))
-serverSock.listen(6)
-
 def mainLoop():
 	cont = 1
 	while 1:
@@ -111,18 +105,38 @@ def waitForLogsAndCompare(N_MSGS):
 		msgs.append(pickle.loads(msgPack))
 		numPeers = numPeers + 1
 
-	unordered = 0
+	# Check log sizes: each peer should have received N_MSGS messages from each of the N peers
+	expected = N * N_MSGS
+	for i in range(len(msgs)):
+		print('Log ' + str(i) + ': ' + str(len(msgs[i])) + ' messages (expected ' + str(expected) + ')')
+		if len(msgs[i]) != expected:
+			print('WARNING: log ' + str(i) + ' has ' + str(len(msgs[i])) + ' messages, expected ' + str(expected))
 
-	# Compare the lists of messages
-	for j in range(0,N_MSGS-1):
-		firstMsg = msgs[0][j]
-		for i in range(1,N-1):
-			if firstMsg != msgs[i][j]:
-				unordered = unordered + 1
-				break
-	
+	unordered = count_unordered_rounds(msgs)
 	print ('Found ' + str(unordered) + ' unordered message rounds')
 
+def count_unordered_rounds(logs):
+	# Compare every position of every log against logs[0]. A position is unordered if
+	# some peer has a different message there or has no message there (shorter log).
+	if not logs:
+		return 0
+	maxLen = max(len(log) for log in logs)
+	unordered = 0
+	for j in range(0, maxLen):
+		firstMsg = logs[0][j] if j < len(logs[0]) else None
+		for i in range(1, len(logs)):
+			if j >= len(logs[0]) or j >= len(logs[i]) or firstMsg != logs[i][j]:
+				unordered = unordered + 1
+				break
+	return unordered
 
-# Initiate server:
-mainLoop()
+
+if __name__ == "__main__":
+	serverSock = socket(AF_INET, SOCK_STREAM)
+	# Allow immediate reuse of the port after closing
+	serverSock.setsockopt(SOL_SOCKET, SO_REUSEADDR, 1)
+	serverSock.bind(('0.0.0.0', SERVER_PORT))
+	serverSock.listen(6)
+
+	# Initiate server:
+	mainLoop()

@@ -53,3 +53,72 @@ comunicação. Sem variáveis de ambiente, o código se comporta exatamente como
 ### Não alterado (de propósito, fica para o Passo 2)
 Lógica de handshake, envio, recepção e comparação; bugs conhecidos (espera ocupada,
 índices da comparação, `recv` de tamanho fixo etc.).
+
+## Passo 2 — Correções do código-base
+
+Correções de bugs do código original que atrapalham a Parte 1. O protocolo de comunicação
+(formato das mensagens, portas, handshake, envio e recepção UDP) não mudou.
+
+### peerCommunicatorUDP.py — espera ocupada pelos handshakes
+- **O que era:** a thread principal esperava os handshakes com `while (handShakeCount < N): pass`.
+- **Por que era problema:** espera ocupada consome 100% de um núcleo enquanto espera e,
+  por causa do GIL, disputa CPU com a própria thread `MsgHandler` que precisa receber os
+  handshakes. Com vários peers na mesma máquina, isso atrasa todos.
+- **O que mudou:** novo `threading.Event` global `allHandshakesReceived`. A thread
+  `MsgHandler` chama `.set()` quando `handShakeCount` chega a N; a thread principal chama
+  `.wait()`. O Event é recriado no início de cada rodada (antes de criar o `MsgHandler`),
+  porque o peer roda várias rodadas no mesmo processo e o Event da rodada anterior já está
+  sinalizado. O contador `handShakeCount` continua existindo para os prints (virou
+  atributo do `MsgHandler`; ver a correção seguinte).
+
+### peerCommunicatorUDP.py — corrida no contador global `handShakeCount`
+- **O que era:** `handShakeCount` era uma variável global, incrementada pela thread
+  `MsgHandler` e zerada só no fim de `run()`, depois de enviar o log ao comparisonServer.
+- **Por que era problema:** corrida entre rodadas. Assim que o comparisonServer recebe todos
+  os logs, ele pode iniciar a rodada seguinte; a thread da rodada nova começa a incrementar o
+  contador enquanto a thread da rodada anterior ainda pode executar o `handShakeCount = 0`.
+  Se o zero vier depois de algum incremento, handshakes recebidos são perdidos na contagem e
+  o peer espera para sempre por um contador que nunca chega a N.
+- **O que mudou:** o contador virou atributo da instância (`self.handShakeCount`, iniciado em
+  0 no construtor), então cada rodada tem o seu. O `handShakeCount = 0` do fim de `run()` e a
+  variável global foram removidos. O print da thread principal usa `msgHandler.handShakeCount`.
+
+### peerCommunicatorUDP.py — `myself` global usado dentro da thread
+- **O que era:** `MsgHandler.run()` nomeava o log com `'logfile'+str(myself)+'.log'`, lendo a
+  variável global `myself` da thread principal.
+- **Por que era problema:** dependência implícita de estado global compartilhado entre
+  threads; o valor lido é o que a thread principal tiver no momento da escrita, não
+  necessariamente o da rodada em que o handler foi criado.
+- **O que mudou:** o ID é passado no construtor (`MsgHandler(sock, myself)`), guardado em
+  `self.myself` e usado para nomear o logfile.
+
+### comparisonServer.py — comparação com índices errados
+- **O que era:** `for j in range(0, N_MSGS-1)` e `for i in range(1, N-1)`.
+- **Por que era problema:** `range` já exclui o limite superior, então o laço ignorava a
+  última posição e o último peer. Além disso, cada log tem `N * N_MSGS` mensagens (N_MSGS
+  de cada peer), mas só as primeiras `N_MSGS - 1` posições eram comparadas. Logs mais curtos
+  (mensagens perdidas) causariam `IndexError` ou passariam despercebidos.
+- **O que mudou:**
+  - Lógica extraída para a função pura `count_unordered_rounds(logs)` (lista de logs → int).
+  - Compara todas as posições (0 até o tamanho do maior log - 1) e todos os peers
+    (1 até `len(logs) - 1`) contra o peer 0. Uma posição conta como fora de ordem se algum
+    peer tiver ali uma mensagem diferente da do peer 0 ou não tiver mensagem nessa posição.
+  - `waitForLogsAndCompare` imprime o tamanho de cada log e o esperado (`N * nMsgs`), com
+    aviso se algum for diferente. A mensagem final continua "Found X unordered message rounds".
+  - A criação do socket do servidor e a chamada `mainLoop()` foram para dentro de
+    `if __name__ == "__main__":`, para os testes importarem a função sem abrir a porta.
+    Rodar o script continua igual.
+- **Testes:** `tests/test_compare.py` (unittest): `python3 -m unittest discover -s tests -v`.
+
+## Problemas conhecidos ainda não corrigidos
+- **UDP sem confirmação/retransmissão e handshake não confiável:** um `READY` ou uma
+  mensagem perdida trava o peer ou deixa o log incompleto. → Passo 5.
+- **Mensagens de dados recebidas durante o laço de handshake são descartadas
+  silenciosamente:** um peer que termina o handshake antes começa a enviar dados, e quem
+  ainda está no laço de handshake ignora tudo que não é `READY`. → Passo 5.
+- **`recv` de tamanho fixo no TCP** (`recv(2048)`, `recv(32768)` etc.): mensagens maiores
+  (ex.: logs grandes) chegam truncadas e o `pickle.loads` falha. → Passo 3 (resolvido pelo RPC).
+- **Registro duplicado e ausência de `unregister` no GroupMngr:** um peer que reinicia é
+  registrado de novo e peers que saem nunca são removidos. → Passo 3.
+- **`pickle` em rede é inseguro:** desserializar dados recebidos pela rede permite execução
+  de código arbitrário. Mantido por compatibilidade; apenas documentado.
