@@ -110,15 +110,65 @@ Correções de bugs do código original que atrapalham a Parte 1. O protocolo de
     Rodar o script continua igual.
 - **Testes:** `tests/test_compare.py` (unittest): `python3 -m unittest discover -s tests -v`.
 
+## Passo 3 — GroupMngr em XML-RPC
+
+Objetivo: trocar o TCP com `pickle` entre o GroupMngr e seus clientes (peer e comparison)
+por XML-RPC da biblioteca padrão, na mesma porta (`GROUPMNGR_TCP_PORT`, 5680). A
+comunicação entre peers continua em UDP. O sinal de início e o envio dos logs entre
+comparison e peer continuam em socket TCP.
+
+### GroupMngr.py
+- **O que era:** socket TCP, `recv(2048)`, `pickle` e despacho por `{"op": ...}`.
+  `register` sempre fazia `append`. `unregister` era `pass`.
+- **O que mudou:** `SimpleXMLRPCServer` com os métodos `register`, `list`, `unregister` e
+  `stop`. A lógica de associação está nas funções puras `register_peer`, `unregister_peer`
+  e `list_peer_ips`. O servidor reutiliza a porta (`allow_reuse_address`) e atende um
+  pedido por vez (`handle_request`), como o `accept` anterior. `stop` só marca o fim do
+  laço; a resposta dessa chamada é enviada antes de o processo sair. O `serverLoop()`
+  ficou dentro de `if __name__ == "__main__":`, para os testes importarem o módulo sem
+  abrir a porta.
+- **`register` sem duplicata:** a identidade é o IP. O mesmo IP e a mesma porta deixam a
+  lista como está. O mesmo IP com outra porta substitui a porta, e `list()` continua
+  devolvendo esse IP uma vez. Um peer que reinicia não aparece duas vezes.
+- **`unregister(ip, porta)`:** remove esse par. Um par que já não está na lista não é
+  erro. A porta faz parte da chave, então um `unregister` atrasado de um processo antigo
+  não apaga um peer que já se registrou de novo com outra porta.
+- **Por quê:** tira o tamanho fixo de `recv` e o `pickle` desse caminho, e corrige o
+  registro duplicado.
+
+### peerCommunicatorUDP.py
+- **O que mudou:** `registerWithGroupManager()` e `getListOfPeers()` usam
+  `xmlrpc.client.ServerProxy`. As 20 tentativas continuam, agora em volta de `register()`,
+  capturando `OSError` e `xmlrpc.client.Error`. Repetir o `register` é seguro: o servidor
+  mantém uma entrada por IP. Ao receber `nMsgs == 0`, o peer chama `unregister` antes de
+  responder ao comparison, para o `stop` do GroupMngr ocorrer depois da saída do grupo.
+- **Não mudou:** handshake, dados e mensagem de fim entre peers (UDP). O TCP que recebe
+  o sinal de início e envia o log ao comparison.
+
+### comparisonServer.py
+- **O que mudou:** a lista de peers (no laço principal e em `waitForPeers`) e o `stop`
+  passam pelo proxy XML-RPC. Uma falha em `stop` é impressa e o comparison ainda encerra,
+  porque nesse modo o objetivo é sair.
+- **Não mudou:** `startPeers` e a recepção dos logs, que seguem em TCP e `pickle`.
+  `AUTO_ROUNDS` continua terminando sem enviar `nMsgs=0` e sem chamar `stop`.
+
+### Testes
+- **`tests/test_groupmngr.py`:** `register` idempotente, troca de porta sem segunda
+  entrada, `unregister` de par existente e de par ausente, e a mesma sequência por
+  XML-RPC, inclusive o `stop`. O comando continua
+  `python3 -m unittest discover -s tests -v`.
+- Não há dependência nova: `xmlrpc` já vem no `python:3.12-slim`. O `requirements.txt`
+  não mudou.
+
 ## Problemas conhecidos ainda não corrigidos
 - **UDP sem confirmação/retransmissão e handshake não confiável:** um `READY` ou uma
   mensagem perdida trava o peer ou deixa o log incompleto. → Passo 5.
 - **Mensagens de dados recebidas durante o laço de handshake são descartadas
   silenciosamente:** um peer que termina o handshake antes começa a enviar dados, e quem
   ainda está no laço de handshake ignora tudo que não é `READY`. → Passo 5.
-- **`recv` de tamanho fixo no TCP** (`recv(2048)`, `recv(32768)` etc.): mensagens maiores
-  (ex.: logs grandes) chegam truncadas e o `pickle.loads` falha. → Passo 3 (resolvido pelo RPC).
-- **Registro duplicado e ausência de `unregister` no GroupMngr:** um peer que reinicia é
-  registrado de novo e peers que saem nunca são removidos. → Passo 3.
+- **`recv` de tamanho fixo no TCP entre comparison e peer** (`recv(512)` na confirmação
+  de início, `recv(1024)` no sinal de start, `recv(32768)` no log): mensagens maiores
+  chegam truncadas e o `pickle.loads` falha. O `recv(2048)` do GroupMngr saiu no Passo 3.
 - **`pickle` em rede é inseguro:** desserializar dados recebidos pela rede permite execução
-  de código arbitrário. Mantido por compatibilidade; apenas documentado.
+  de código arbitrário. Saiu do caminho do GroupMngr (XML-RPC). Continua no UDP entre
+  peers e no TCP entre comparison e peer.
