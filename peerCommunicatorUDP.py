@@ -5,6 +5,7 @@ import random
 import time
 import pickle
 import os
+import xmlrpc.client
 from requests import get
 
 #handShakes = [] # not used; only if we need to check whose handshake is missing
@@ -13,6 +14,7 @@ from requests import get
 allHandshakesReceived = threading.Event()
 
 PEERS = []
+myIpAddr = None
 
 # UDP sockets to send and receive data messages:
 # Create send socket
@@ -41,40 +43,46 @@ def get_public_ip():
   print('My public IP address is: {}'.format(ipAddr))
   return ipAddr
 
-# Function to register this peer with the group manager
+def groupManagerProxy():
+  # XML-RPC to the group manager. Messages between peers stay on UDP.
+  return xmlrpc.client.ServerProxy(
+    'http://%s:%s' % (GROUPMNGR_ADDR, GROUPMNGR_TCP_PORT),
+    allow_none=True)
+
+# Register this peer with the group manager.
 def registerWithGroupManager():
+  global myIpAddr
   print ('Connecting to group manager: ', (GROUPMNGR_ADDR,GROUPMNGR_TCP_PORT))
-  # Retry: the group manager may not be up yet (e.g., when started by Docker Compose)
+  myIpAddr = get_public_ip()
+  req = {'ipaddr': myIpAddr, 'port': PEER_UDP_PORT}
+  print ('Registering with group manager: ', req)
+  # Retry: the group manager may not be up yet (e.g., when started by Docker Compose).
+  # A repeated register is safe: the server keeps a single entry per IP.
   for attempt in range(1, 21):
-    clientSock = socket(AF_INET, SOCK_STREAM)
     try:
-      clientSock.connect((GROUPMNGR_ADDR,GROUPMNGR_TCP_PORT))
+      groupManagerProxy().register(myIpAddr, PEER_UDP_PORT)
       break
-    except OSError as e:
-      clientSock.close()
+    except (OSError, xmlrpc.client.Error) as e:
       print('Group manager not available (attempt ' + str(attempt) + '/20): ', e)
       if attempt == 20:
         raise
       time.sleep(0.5)
-  ipAddr = get_public_ip()
-  req = {"op":"register", "ipaddr":ipAddr, "port":PEER_UDP_PORT}
-  msg = pickle.dumps(req)
-  print ('Registering with group manager: ', req)
-  clientSock.send(msg)
-  clientSock.close()
+
+def unregisterFromGroupManager():
+  if myIpAddr is None:
+    return
+  req = {'ipaddr': myIpAddr, 'port': PEER_UDP_PORT}
+  print ('Unregistering from group manager: ', req)
+  try:
+    groupManagerProxy().unregister(myIpAddr, PEER_UDP_PORT)
+  except (OSError, xmlrpc.client.Error) as e:
+    print('Could not unregister from group manager: ', e)
 
 def getListOfPeers():
-  clientSock = socket(AF_INET, SOCK_STREAM)
   print ('Connecting to group manager: ', (GROUPMNGR_ADDR,GROUPMNGR_TCP_PORT))
-  clientSock.connect((GROUPMNGR_ADDR,GROUPMNGR_TCP_PORT))
-  req = {"op":"list"}
-  msg = pickle.dumps(req)
-  print ('Getting list of peers from group manager: ', req)
-  clientSock.send(msg)
-  msg = clientSock.recv(2048)
-  PEERS = pickle.loads(msg)
+  print ('Getting list of peers from group manager')
+  PEERS = groupManagerProxy().list()
   print ('Got list of peers: ', PEERS)
-  clientSock.close()
   return PEERS
 
 class MsgHandler(threading.Thread):
@@ -144,6 +152,10 @@ def waitToStart():
   msg = pickle.loads(msgPack)
   myself = msg[0]
   nMsgs = msg[1]
+  # Leave the group before acknowledging termination. startPeers waits for
+  # this reply, and only then does the comparison server stop the group manager.
+  if nMsgs == 0:
+    unregisterFromGroupManager()
   conn.send(pickle.dumps('Peer process '+str(myself)+' started.'))
   conn.close()
   return (myself,nMsgs)

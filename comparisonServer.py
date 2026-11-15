@@ -1,5 +1,6 @@
 from socket import *
 import pickle
+import xmlrpc.client
 from constMP import *
 import time
 import sys
@@ -13,18 +14,16 @@ if os.environ.get('AUTO_ROUNDS', '').strip():
 	if any(n <= 0 for n in autoRounds):
 		sys.exit('ERROR: AUTO_ROUNDS must contain only positive integers (e.g., "20" or "20,50")')
 
+def groupManagerProxy():
+	return xmlrpc.client.ServerProxy(
+		'http://%s:%s' % (GROUPMNGR_ADDR, GROUPMNGR_TCP_PORT),
+		allow_none=True)
+
 def mainLoop():
 	cont = 1
 	while 1:
 		nMsgs = promptUser()
-		clientSock = socket(AF_INET, SOCK_STREAM)
-		clientSock.connect((GROUPMNGR_ADDR,GROUPMNGR_TCP_PORT))
-		req = {"op":"list"}
-		msg = pickle.dumps(req)
-		clientSock.send(msg)
-		msg = clientSock.recv(2048)
-		clientSock.close()
-		peerList = pickle.loads(msg)
+		peerList = groupManagerProxy().list()
 		print("List of Peers: ", peerList)
 		startPeers(peerList,nMsgs)
 		if nMsgs != 0:
@@ -33,14 +32,12 @@ def mainLoop():
 		else:
 			print('Stopping.')
 			serverSock.close()
-			
+
 			# Tell group manager to stop
-			cSock = socket(AF_INET, SOCK_STREAM)
-			cSock.connect((GROUPMNGR_ADDR,GROUPMNGR_TCP_PORT))
-			req = {"op":"stop"}
-			msg = pickle.dumps(req)
-			cSock.send(msg)
-			cSock.close()
+			try:
+				groupManagerProxy().stop()
+			except (OSError, xmlrpc.client.Error) as e:
+				print('Group manager stop: ', e)
 			break
 
 def promptUser():
@@ -61,15 +58,10 @@ def waitForPeers(timeout=60):
 	deadline = time.time() + timeout
 	peerList = []
 	while True:
-		clientSock = socket(AF_INET, SOCK_STREAM)
 		try:
-			clientSock.connect((GROUPMNGR_ADDR,GROUPMNGR_TCP_PORT))
-			clientSock.send(pickle.dumps({"op":"list"}))
-			peerList = pickle.loads(clientSock.recv(2048))
-		except (OSError, EOFError) as e:
+			peerList = groupManagerProxy().list()
+		except (OSError, xmlrpc.client.Error) as e:
 			print('Group manager not available: ', e)
-		finally:
-			clientSock.close()
 		if len(peerList) >= N:
 			return
 		if time.time() >= deadline:
