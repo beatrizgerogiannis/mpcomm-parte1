@@ -1,7 +1,8 @@
 #!/bin/sh
 # Runs one experiment scenario with Docker Compose and prints the evidence: exit code of the
 # comparison server, its "unordered message rounds", the output of tests/check_logs.py (loss,
-# duplicates, FIFO violations, old logs) and the per-round summaries of the peers.
+# duplicates, FIFO violations, old logs), the per-round summaries of the peers and every
+# ERROR/WARNING line of the peers and of the comparison server (all rounds, not only the last).
 #
 # Prerequisites (on the host):
 #   - git      (commit hash and clean/dirty state in the header)
@@ -19,6 +20,9 @@
 # Must be run from the repository root. It deletes and recreates logs/ and stops the containers
 # (docker compose down) at the end. If docker compose exits with a code other than 0, check_logs
 # is NOT run ("SKIPPED"), compose-up.out is kept for inspection and the script exits with that code.
+# Exit code: 0 only if compose, check_logs AND the search for ERROR/WARNING all pass. check_logs
+# only sees the LAST round (logs are overwritten), so an ERROR or WARNING in any round prints
+# "FAILED: erro ou aviso em alguma rodada" and makes the script fail even if check_logs says OK.
 #
 # Example (saves the output as evidence). Write OUTSIDE the repository and move it afterwards:
 # a "| tee docs/evidencias/..." truncates a versioned file before the clean/dirty check runs,
@@ -51,8 +55,19 @@ if [ "$CODE" -ne 0 ]; then
   exit "$CODE"
 fi
 echo "--- python3 tests/check_logs.py --since $START $NPEERS $LAST_MSGS ---"
-python3 tests/check_logs.py --since "$START" "$NPEERS" "$LAST_MSGS"; echo "check_logs código: $?"
-echo "--- resumos por rodada (peers) ---"
-docker compose logs peer | grep -iE "finished|held|ERROR" | tail -n 12
+python3 tests/check_logs.py --since "$START" "$NPEERS" "$LAST_MSGS"
+CHECK=$?
+echo "check_logs código: $CHECK"
+echo "--- resumos por rodada, erros e avisos (peers e comparison, todas as rodadas) ---"
+LINES=$(docker compose logs peer comparison 2>&1 | grep -E "finished|ERROR|WARNING")
+printf '%s\n' "$LINES"
+WARN=0
+if printf '%s\n' "$LINES" | grep -qE "ERROR|WARNING"; then
+  echo "FAILED: erro ou aviso em alguma rodada"
+  WARN=1
+fi
 docker compose down > /dev/null 2>&1
 rm -f compose-up.out
+if [ "$CHECK" -ne 0 ]; then FINAL=$CHECK; else FINAL=$WARN; fi
+echo "script código: $FINAL"
+exit "$FINAL"
