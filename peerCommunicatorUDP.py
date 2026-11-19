@@ -252,6 +252,7 @@ def sendLog(logList):
   clientSock.send(msgPack)
   clientSock.close()
 
+# Describes what is missing in round r (called on timeout): READY, gaps per sender, END
 # Describes what is missing in round r (called on timeout): READY, gaps per sender, END, and the
 # messages stuck in the holdback (received but not delivered because a lower seq is missing)
 def describeMissing(r):
