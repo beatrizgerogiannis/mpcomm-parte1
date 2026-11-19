@@ -3,4 +3,4 @@ __pycache__/
 *.pyc
 .venv/
 *.log
-CLAUDE.md
+compose-up.out

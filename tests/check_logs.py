@@ -5,11 +5,14 @@
 # exactly 0, 1, ..., nMsgs-1. The order between different senders is free (FIFO is not total
 # order). Exit code 0 if all logs are OK, 1 otherwise.
 #
-# For each log it prints the modification time (to avoid a false OK on an old log) and the number
-# of FIFO violations: consecutive entries of the same sender with the later seq smaller than the
-# earlier one.
+# For each log it prints the modification time and the number of FIFO violations: consecutive
+# entries of the same sender with the later seq smaller than the earlier one.
 #
-# Usage: python3 tests/check_logs.py N nMsgs [logs_dir]   (logs_dir defaults to ./logs)
+# --since EPOCH: a log modified before EPOCH (seconds since 1970, e.g. `date +%s` taken before
+# the experiment) is FAILED with "log antigo: <file>", so an old log never gives a false OK.
+#
+# Usage: python3 tests/check_logs.py [--since EPOCH] N nMsgs [logs_dir]   (logs_dir defaults to ./logs)
+import argparse
 import ast
 import glob
 import os
@@ -61,11 +64,16 @@ def fifo_ok(entries, n, n_msgs):
 
 
 def main():
-	if len(sys.argv) not in (3, 4):
-		sys.exit('Usage: python3 tests/check_logs.py N nMsgs [logs_dir]')
-	n = int(sys.argv[1])
-	n_msgs = int(sys.argv[2])
-	logs_dir = sys.argv[3] if len(sys.argv) == 4 else 'logs'
+	parser = argparse.ArgumentParser(description='Checks loss, duplicates and FIFO order in the peers\' logs')
+	parser.add_argument('n', type=int, metavar='N', help='number of peers')
+	parser.add_argument('n_msgs', type=int, metavar='nMsgs', help='messages per peer in the last round')
+	parser.add_argument('logs_dir', nargs='?', default='logs', help='directory of logfile*.log (default: logs)')
+	parser.add_argument('--since', type=float, metavar='EPOCH',
+						help='logs modified before this epoch are FAILED ("log antigo")')
+	args = parser.parse_args()
+	n = args.n
+	n_msgs = args.n_msgs
+	logs_dir = args.logs_dir
 
 	files = sorted(glob.glob(os.path.join(logs_dir, 'logfile*.log')))
 	ok = True
@@ -80,9 +88,12 @@ def main():
 				print(path + ': ERROR: cannot parse log: ' + str(e))
 				ok = False
 				continue
-		mtime = time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(os.path.getmtime(path)))
+		mtime_epoch = os.path.getmtime(path)
+		mtime = time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(mtime_epoch))
 		print(path + ': modified ' + mtime)
 		problems = check_log(entries, n, n_msgs)
+		if args.since is not None and mtime_epoch < args.since:
+			problems.insert(0, 'log antigo: ' + path)
 		violations, examples = fifo_violations(entries)
 		print(path + ': ' + str(violations) + ' FIFO violations' +
 			  (' (sender, earlier seq, later seq): ' + str(examples) if examples else ''))

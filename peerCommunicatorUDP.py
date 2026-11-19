@@ -179,7 +179,11 @@ class MsgHandler(threading.Thread):
           r.allReady.set()
       elif kind == 'DATA':
         seq = msg[3]
-        if st.seen(sender, seq):
+        if not st.valid_seq(sender, seq):
+          st.on_data(sender, seq)   # counts it as invalid; the ACK above was already sent
+          print('Discarded message ' + str(seq) + ' from process ' + str(sender) +
+                ' (invalid seq: negative or >= total of its END)')
+        elif st.seen(sender, seq):
           st.on_data(sender, seq)   # counts the duplicate
           print('Duplicate message ' + str(seq) + ' from process ' + str(sender) + ' discarded')
         else:
@@ -330,11 +334,16 @@ while 1:
       sendReliable(addrToSend, ('END', rnd.number, myself, nMsgs))
 
     # Wait until I received everything (or timeout), and everyone acknowledged everything I
-    # sent (bounded: items are dropped after MAX_RETRIES retransmissions)
+    # sent (or timeout; items are also dropped after MAX_RETRIES retransmissions)
     timedOut = not rnd.complete.wait(ROUND_TIMEOUT)
     if not timedOut:
       with pendingCond:
-        pendingCond.wait_for(pending.empty)
+        acked = pendingCond.wait_for(pending.empty, timeout=ROUND_TIMEOUT)
+        stillPending = [] if acked else pending.keys()
+      if not acked:
+        # Do not hang: write and send the log anyway (the retransmitter keeps trying up to MAX_RETRIES)
+        print('ERROR: round ' + str(rnd.number) + ': pending sends not acknowledged after ' +
+              str(ROUND_TIMEOUT) + ' s (destination, kind, round, sender, seq): ' + str(stillPending))
 
   if timedOut:
     # Do not hang: send the partial log so that the verification reports the loss

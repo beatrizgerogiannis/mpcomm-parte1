@@ -142,10 +142,13 @@ comparisonServer continua sendo uma lista de tuplas `(remetente, seq)`.
   peer imprime `ERROR: giving up on ...` e desiste daquele item.
 - **Duplicatas:** o receptor responde ACK a **toda** cópia recebida (o ACK anterior pode ter
   se perdido), mas só a primeira entra no log; as outras são descartadas e contadas.
-- **Fim da rodada:** o peer só termina a rodada quando (a) recebeu `END` de todos os N e,
-  para cada remetente, todas as mensagens `0..total-1`, e (b) recebeu ACK de tudo o que
-  enviou (para garantir que os outros receberam tudo dele). Só então grava
-  `logfile<ID>.log` e envia o log.
+- **Fim da rodada:** o peer termina a rodada quando (a) recebeu `END` de todos os N e,
+  para cada remetente, todas as mensagens `0..total-1`, e (b) não há mais nada pendente do
+  que ele enviou (para garantir que os outros receberam tudo dele). Uma pendência sai da
+  lista quando chega o ACK **ou** quando o peer desiste dela depois de `MAX_RETRIES`
+  retransmissões; nesse segundo caso a rodada termina **sem** o ACK daquele item (o
+  `ERROR: giving up on ...` fica no log do peer). Só então grava `logfile<ID>.log` e envia
+  o log. (Desde o Passo 5.1 as esperas (a) e, desde o Passo 6.1, (b) também têm timeout.)
 - **Por que ACK positivo e não NACK:** com NACK o receptor só percebe uma perda quando
   chega uma mensagem posterior (lacuna). A perda da **última** mensagem de um remetente, ou
   do próprio `END`, não deixa lacuna nenhuma, então nunca seria pedida de novo sem um
@@ -251,8 +254,11 @@ das mensagens, ACK, regra de rodadas) não mudou; só foram extraídas funções
 - **Cenário em que falhava:** se um peer desistisse de um item (`MAX_RETRIES`) ou morresse,
   quem esperava por ele ficava bloqueado para sempre; o comparisonServer também, esperando
   o log. Nada era reportado.
-- **O que mudou:** as duas esperas usam `ROUND_TIMEOUT_S` (padrão 120 s, repassada pelo
-  Compose). No timeout, o peer imprime `ERROR: round R timed out after T s: missing READY from
+- **O que mudou:** as duas esperas por eventos (`allReady` e `complete`) usam
+  `ROUND_TIMEOUT_S` (padrão 120 s, repassada pelo Compose). A terceira espera da rodada, pelas
+  pendências (`pendingCond.wait_for(pending.empty)`), ficou sem timeout neste passo; ela era
+  limitada só pelo `MAX_RETRIES` e ganhou timeout no Passo 6.1. Agora são três esperas, todas
+  com timeout. No timeout, o peer imprime `ERROR: round R timed out after T s: missing READY from
   [...]; gaps per sender {...}; missing END from [...]` (lacunas: seqs que faltam abaixo do
   `total` do `END`, ou abaixo do maior seq recebido quando o `END` não chegou), grava o log
   parcial e chama `sendLog` normalmente, para a verificação acusar a perda em vez de travar.
@@ -345,7 +351,10 @@ que ele as enviou (0, 1, ..., nMsgs-1), mesmo com perda, retransmissão e atraso
 - `tests/check_logs.py`: além de perdas e duplicatas, verifica FIFO (para cada remetente, a
   subsequência do log é exatamente 0..nMsgs-1), imprime por log o número de violações (pares
   consecutivos do mesmo remetente com seq decrescente, com até 5 exemplos) e a data de
-  modificação do arquivo (para não dar OK com log antigo). Sai com 1 se houver violação.
+  modificação do arquivo. Sai com 1 se houver violação. Neste passo a data era só
+  informativa: um log antigo ainda podia dar OK. Desde o Passo 6.1, com `--since <epoch>`
+  (que o `scripts/run_scenario.sh` passa automaticamente), um log modificado antes do início
+  do experimento vira FAILED com `log antigo: <arquivo>`.
   Observação: cada rodada sobrescreve `logfile<ID>.log`, então o check vale para a **última**
   rodada.
 
@@ -354,10 +363,13 @@ que ele as enviou (0, 1, ..., nMsgs-1), mesmo com perda, retransmissão e atraso
 |---|---|---|---|---|
 | `delay 20ms 10ms loss 10%`, código **antigo** (`fifo-antes.txt`) | 0 | FAILED | 6, 7, 11, 10, 8, 7 (49 no total) | — |
 | `delay 20ms 10ms loss 10%`, código **novo** (`fifo-depois.txt`) | 0 | OK | 0 em todos | 11–42 |
-| `loss 10%` | 0 | OK | 0 em todos | 15–33 |
-| (nenhum) | 0 | OK | 0 em todos | 0 |
+| `loss 10%` (medido, sem saída salva) | 0 | OK | 0 em todos | 15–33 |
+| (nenhum) (medido, sem saída salva) | 0 | OK | 0 em todos | 0 |
 
 Saídas completas em `docs/evidencias/fifo-antes.txt` e `docs/evidencias/fifo-depois.txt`.
+Proveniência do `fifo-antes.txt`: peer e `reliability.py` do commit 0b1036d (sem FIFO) e
+`tests/check_logs.py` do commit 7efaef5 (com a verificação FIFO); a nota está no topo do
+arquivo. O `fifo-depois.txt` será gerado de novo a partir de um commit limpo (Passo 6.1).
 
 ### "unordered message rounds" continua acusando diferenças (esperado)
 A métrica do comparisonServer compara posição a posição o log de cada peer com o do peer 0,
@@ -366,6 +378,81 @@ diferente mensagens de remetentes diferentes, e as duas ordens são FIFO válida
 com perda/atraso, o número continua alto (117–119 de 120 nas execuções acima) mesmo com
 check_logs OK, e mesmo sem netem aparecem algumas posições diferentes (ex.: 6 e 3). Ordem
 total é da Parte 3.
+
+## Passo 6.1 — Ajustes de evidências e casos-limite
+
+Ajustes apontados na revisão final da 1b. O protocolo (formatos, ACK, regras de rodada) e o
+FIFO não mudaram.
+
+### tests/check_logs.py — log antigo podia dar OK
+- **O que era:** a data de modificação de cada log era só impressa.
+- **Por que era problema:** se os peers não gravassem o log (ex.: experimento travado), o
+  `logs/` de uma execução anterior seria verificado e poderia dar OK.
+- **O que mudou:** argumento opcional `--since <epoch>`. Um log com data de modificação
+  anterior vira FAILED com `log antigo: <arquivo>`. Os argumentos posicionais (`N nMsgs
+  [logs_dir]`) continuam iguais; o parser passou a ser o `argparse` (biblioteca padrão).
+
+### scripts/run_scenario.sh — evidência sem procedência clara
+- **O que era:** o cabeçalho sempre dizia `commit <hash> + working tree`, mesmo sem
+  alterações locais; o `check_logs` rodava mesmo se o `docker compose` falhasse (timeout,
+  peer morto), e o `AUTO_ROUNDS` era fixo em `20,20`.
+- **Por que era problema:** não dava para saber se a evidência veio de um commit limpo, e um
+  compose com erro podia vir seguido de um `check_logs` sobre logs parciais ou antigos.
+- **O que mudou:**
+  - guarda o epoch no início e passa `--since` ao `check_logs`;
+  - se o código de saída do `docker compose` for diferente de 0, **não** roda o `check_logs`:
+    imprime `SKIPPED: compose saiu com código X`, as linhas `ERROR` dos peers, mantém o
+    `compose-up.out` para inspeção e sai com esse código;
+  - o cabeçalho mostra o hash curto e `clean` ou `dirty`, conforme `git status --porcelain`
+    (calculado antes de mexer em `logs/`);
+  - `AUTO_ROUNDS` e `N_PEERS` podem vir do ambiente (padrão `20,20` e 6); o `check_logs` usa
+    o **último** valor de `AUTO_ROUNDS`, porque cada rodada sobrescreve o log. O `NETEM` pode
+    vir do primeiro argumento (como antes) ou, se ele não for passado, do ambiente;
+  - o topo do arquivo documenta os pré-requisitos: git, python3, Docker com Compose v2;
+  - o exemplo do cabeçalho grava a saída **fora** do repositório e move depois: um
+    `| tee docs/evidencias/...` trunca um arquivo versionado antes da verificação
+    `clean`/`dirty`, e o cabeçalho sairia sempre `dirty`.
+
+### peerCommunicatorUDP.py — espera pelas pendências sem timeout
+- **O que era:** `pendingCond.wait_for(pending.empty)` sem timeout.
+- **Por que era problema:** era a única espera da rodada sem timeout. Ela é limitada pelo
+  `MAX_RETRIES` só enquanto a thread de retransmissão estiver viva e funcionando; qualquer
+  falha nisso deixaria o peer preso sem gravar nem enviar o log.
+- **O que mudou:** `wait_for(pending.empty, timeout=ROUND_TIMEOUT)` (variável de ambiente
+  `ROUND_TIMEOUT_S`). No timeout, imprime `ERROR: round R: pending sends not acknowledged
+  after T s (destination, kind, round, sender, seq): [...]` com a lista do que ficou pendente
+  (novo `PendingSends.keys()`) e segue para gravar e enviar o log, como nas outras esperas.
+  As pendências continuam sendo retransmitidas até `MAX_RETRIES`.
+
+### reliability.py — `DATA` com seq impossível travava a rodada
+- **O que era:** `RoundState.on_data` aceitava qualquer seq.
+- **Por que era problema:** um seq negativo ou maior ou igual ao `total` do `END` nunca é
+  entregue (não existe nada antes dele que chegue a `next_deliver`), então ficava no holdback
+  para sempre e `is_complete()` nunca dava verdadeiro: a rodada só terminava pelo timeout.
+- **O que mudou:** novo `RoundState.valid_seq(s, seq)`; `on_data` descarta (devolve `[]`,
+  conta em `invalid`) mensagens com `seq < 0` ou, quando o `END` do remetente já chegou,
+  `seq >= total`. O peer continua respondendo ACK a elas (o ACK é enviado antes do
+  tratamento) e imprime `Discarded message k from process s (invalid seq: ...)`, em vez de
+  `Gap:`/`put in holdback`. Limite conhecido: um seq `>= total` que chegue **antes** do `END`
+  vai para o holdback (o total ainda não é conhecido) e continua lá.
+- **Testes:** `test_negative_seq_discarded`, `test_seq_beyond_total_discarded_after_end` e
+  `test_keys_lists_pending`. `test_not_complete_while_holdback_not_empty` mudou: a mensagem
+  5 (além do total 2) agora chega **antes** do `END`, porque depois dele ela é descartada; o
+  teste continua verificando que holdback não vazio impede `is_complete()`.
+
+### .gitignore
+- Acrescentado `compose-up.out` (fica no disco quando o compose falha).
+- Removida a linha que ignorava o `CLAUDE.md`: ele passa a ser versionado.
+
+### docs/
+- `docs/evidencias/fifo-antes.txt`: não foi gerado de novo; ganhou no topo a nota de
+  procedência (peer e `reliability.py` do commit 0b1036d, `tests/check_logs.py` do 7efaef5).
+- `docs/evidencias/fifo-depois.txt`: não alterado; será gerado de novo a partir de um commit
+  limpo com o `scripts/run_scenario.sh`.
+- Novo `docs/integracao-rpc.md`: guia para a integração do xmlrpc (Passo 3) com a 1b
+  (tuplas → listas, `allow_none`, `start` que só enfileira, `sendLog` na thread principal,
+  timeout esperando os logs, encerramento, ordem da lista, portas, `logRequests=False` e
+  conflitos de merge esperados).
 
 ## Problemas conhecidos ainda não corrigidos
 - ~~**UDP sem confirmação/retransmissão e handshake não confiável:** um `READY` ou uma
