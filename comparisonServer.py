@@ -112,8 +112,93 @@ def waitForLogsAndCompare(N_MSGS):
 		if len(msgs[i]) != expected:
 			print('WARNING: log ' + str(i) + ' has ' + str(len(msgs[i])) + ' messages, expected ' + str(expected))
 
+	# --- Metric 1: FIFO and absence of loss per sender (Issue #6) ---
+	fifo_results = check_fifo_and_completeness(msgs, N_MSGS, N)
+	print('\n=== Metric 1: FIFO and Completeness Check (Per-Sender Order) ===')
+	all_ok = True
+	for i, peer_result in enumerate(fifo_results):
+		status = 'OK' if peer_result['ok'] else 'FAIL'
+		print('  Peer log ' + str(i) + ': ' + status)
+		for problem in peer_result['problems']:
+			print('    - ' + problem)
+		if not peer_result['ok']:
+			all_ok = False
+	if all_ok:
+		print('  All peers delivered every message (0..' + str(N_MSGS-1) + ') without loss, duplicates, or FIFO violations.')
+	else:
+		print('  WARNING: Some peers failed FIFO or completeness check!')
+
+	# --- Metric 2: Total order (Original metric, kept for comparison) ---
 	unordered = count_unordered_rounds(msgs)
-	print ('Found ' + str(unordered) + ' unordered message rounds')
+	print('\n=== Metric 2: Total Order Check (Global Interleaving) ===')
+	print('  Found ' + str(unordered) + ' unordered message rounds')
+	print('  (Demonstration: FIFO order != Total order. Messages from different senders')
+	print('   may be delivered in different orders across peers without violating FIFO.)\n')
+
+def check_fifo_and_completeness(logs, n_msgs, n_peers=None):
+	"""
+	For every peer log, verify that for each sender:
+	  - Delivered messages are exactly 0..n_msgs-1
+	  - Without gaps / losses (all expected seq numbers present)
+	  - Without duplicates
+	  - In FIFO order per sender (strictly ascending order of sequence numbers)
+
+	Returns a list (one entry per log) of dicts:
+	  {'ok': bool, 'problems': [str]}
+	"""
+	if n_peers is None:
+		n_peers = N
+
+	results = []
+	for log_idx, log in enumerate(logs):
+		problems = []
+		# Group messages by sender
+		messages_by_sender = {s: [] for s in range(n_peers)}
+		for entry in log:
+			sender, seq = entry[0], entry[1]
+			if sender not in messages_by_sender:
+				messages_by_sender[sender] = []
+			messages_by_sender[sender].append(seq)
+
+		for sender in range(n_peers):
+			seqs = messages_by_sender.get(sender, [])
+
+			# Check duplicates
+			seen = set()
+			duplicates = []
+			for seq in seqs:
+				if seq in seen and seq not in duplicates:
+					duplicates.append(seq)
+				seen.add(seq)
+			if duplicates:
+				problems.append(
+					'duplicate messages from sender ' + str(sender) + ': seqs ' + str(duplicates))
+
+			# Check FIFO order (strictly ascending per sender)
+			last_seq = -1
+			order_violations = []
+			for seq in seqs:
+				if last_seq != -1 and seq <= last_seq:
+					order_violations.append((last_seq, seq))
+				last_seq = seq
+			if order_violations:
+				problems.append(
+					'FIFO violations from sender ' + str(sender) + ' (earlier, later): ' + str(order_violations))
+
+			# Check missing / gaps
+			expected_seqs = set(range(n_msgs))
+			missing = sorted(expected_seqs - seen)
+			if missing:
+				problems.append(
+					'missing seqs from sender ' + str(sender) + ': ' + str(missing))
+
+			extra = sorted(seen - expected_seqs)
+			if extra:
+				problems.append(
+					'unexpected seqs from sender ' + str(sender) + ': ' + str(extra))
+
+		results.append({'ok': len(problems) == 0, 'problems': problems})
+	return results
 
 def count_unordered_rounds(logs):
 	# Compare every position of every log against logs[0]. A position is unordered if
