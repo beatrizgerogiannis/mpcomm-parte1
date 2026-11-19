@@ -46,15 +46,22 @@ def should_give_up(sends, max_retries):
 
 
 class RoundState:
-  # What this peer has received in the current round
+  # What this peer has received in the current round.
+  # DATA messages are delivered (appended to the log) in FIFO order per sender, using a hold-back
+  # queue: a message that arrives before a lower seq of the same sender waits in holdback until
+  # every lower seq has been delivered. The order between different senders is free.
 
   def __init__(self, n_peers):
     self.n_peers = n_peers
     self.ready = set()      # IDs of the peers whose handshake was received
-    self.received = {}      # sender -> set of received seqs (to discard duplicates)
+    self.received = {}      # sender -> set of received seqs, delivered or held (to discard duplicates)
+    self.next_deliver = {}  # sender -> lowest seq not yet delivered (0 at the start)
+    self.holdback = {}      # sender -> set of seqs received but waiting for a lower seq
     self.totals = {}        # sender -> total of messages announced in its END
-    self.log = []           # delivered messages (sender, seq), in arrival order
+    self.log = []           # delivered messages (sender, seq), in delivery (FIFO) order
     self.duplicates = 0     # duplicates discarded (READY, DATA and END)
+    self.held_back = 0      # DATA messages that went through the holdback
+    self.invalid = 0        # DATA discarded for an impossible seq (see valid_seq)
 
   def on_ready(self, sender):
     # True if this handshake is new
@@ -64,15 +71,46 @@ class RoundState:
     self.ready.add(sender)
     return True
 
+  def seen(self, sender, seq):
+    # True if (sender, seq) was already received (delivered or in the holdback)
+    return seq in self.received.get(sender, ())
+
+  def valid_seq(self, sender, seq):
+    # False for a seq that can never be delivered: negative, or >= the total announced in the
+    # sender's END (only known after the END arrives). Such a message would stay in the holdback
+    # forever and the round would never complete.
+    if seq < 0:
+      return False
+    total = self.totals.get(sender)
+    return total is None or seq < total
+
   def on_data(self, sender, seq):
-    # True if this message is new; new messages are appended to the log
+    # Returns the list of messages (sender, seq) delivered by this call, in order: empty if the
+    # message is a duplicate, has an invalid seq (discarded, see valid_seq) or was put in the holdback
+    if not self.valid_seq(sender, seq):
+      self.invalid += 1
+      return []
     seqs = self.received.setdefault(sender, set())
     if seq in seqs:
       self.duplicates += 1
-      return False
+      return []
     seqs.add(seq)
-    self.log.append((sender, seq))
-    return True
+    nxt = self.next_deliver.get(sender, 0)
+    held = self.holdback.setdefault(sender, set())
+    if seq != nxt:
+      # seq > nxt (seq < nxt would already be in received): wait for the missing ones
+      held.add(seq)
+      self.held_back += 1
+      return []
+    delivered = [(sender, seq)]
+    nxt += 1
+    while nxt in held:
+      held.remove(nxt)
+      delivered.append((sender, nxt))
+      nxt += 1
+    self.next_deliver[sender] = nxt
+    self.log.extend(delivered)
+    return delivered
 
   def on_end(self, sender, total):
     # True if this END is new
@@ -85,27 +123,30 @@ class RoundState:
   def all_ready(self):
     return len(self.ready) >= self.n_peers
 
-  def next_expected(self, sender):
-    # Highest seq received from sender + 1 (0 if nothing was received yet)
-    seqs = self.received.get(sender)
-    return max(seqs) + 1 if seqs else 0
+  def highest(self, sender):
+    # Highest seq received from sender (delivered or held), -1 if nothing was received yet
+    held = self.holdback.get(sender)
+    return max(self.next_deliver.get(sender, 0) - 1, max(held) if held else -1)
 
   def gaps(self, sender):
-    # Missing seqs below the highest seq received from sender
-    seqs = self.received.get(sender)
-    if not seqs:
+    # Missing seqs that block the holdback: from next_deliver up to the highest held seq
+    held = self.holdback.get(sender)
+    if not held:
       return []
-    return [k for k in range(max(seqs)) if k not in seqs]
+    return [k for k in range(self.next_deliver.get(sender, 0), max(held)) if k not in held]
+
+  def held(self, sender):
+    # Seqs of sender waiting in the holdback, sorted
+    return sorted(self.holdback.get(sender, ()))
 
   def is_complete(self):
-    # END from all N peers and, for each of them, all messages 0..total-1
+    # END from all N peers, all messages 0..total-1 of each of them DELIVERED, holdback empty
     if len(self.totals) < self.n_peers:
       return False
     for sender, total in self.totals.items():
-      seqs = self.received.get(sender, set())
-      if any(k not in seqs for k in range(total)):
+      if self.next_deliver.get(sender, 0) < total:
         return False
-    return True
+    return not any(self.holdback.values())
 
 
 class PendingSends:
@@ -138,6 +179,10 @@ class PendingSends:
 
   def empty(self):
     return not self._items
+
+  def keys(self):
+    # Pending keys, sorted (for error messages)
+    return sorted(self._items, key=repr)
 
   def __len__(self):
     return len(self._items)

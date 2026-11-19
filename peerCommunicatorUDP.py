@@ -179,16 +179,26 @@ class MsgHandler(threading.Thread):
           r.allReady.set()
       elif kind == 'DATA':
         seq = msg[3]
-        expected = st.next_expected(sender)
-        if st.on_data(sender, seq):
+        if not st.valid_seq(sender, seq):
+          st.on_data(sender, seq)   # counts it as invalid; the ACK above was already sent
+          print('Discarded message ' + str(seq) + ' from process ' + str(sender) +
+                ' (invalid seq: negative or >= total of its END)')
+        elif st.seen(sender, seq):
+          st.on_data(sender, seq)   # counts the duplicate
+          print('Duplicate message ' + str(seq) + ' from process ' + str(sender) + ' discarded')
+        else:
+          expected = st.highest(sender) + 1
           if seq > expected:
             r.gapsDetected += 1
             print('Gap: from process ' + str(sender) + ' expected ' + str(expected) + ', got ' + str(seq))
           elif seq < expected:
             print('Late message ' + str(seq) + ' from process ' + str(sender) + ' fills a gap')
-          print('Message ' + str(seq) + ' from process ' + str(sender))
-        else:
-          print('Duplicate message ' + str(seq) + ' from process ' + str(sender) + ' discarded')
+          delivered = st.on_data(sender, seq)
+          if not delivered:
+            print('Message ' + str(seq) + ' from process ' + str(sender) + ' put in holdback (waiting for ' +
+                  str(st.next_deliver.get(sender, 0)) + ')')
+          for (s, k) in delivered:
+            print('Message ' + str(k) + ' from process ' + str(s))
       elif kind == 'END':
         if not st.on_end(sender, msg[3]):
           print('Duplicate END from process ' + str(sender) + ' discarded')
@@ -243,11 +253,14 @@ def sendLog(logList):
   clientSock.close()
 
 # Describes what is missing in round r (called on timeout): READY, gaps per sender, END
+# Describes what is missing in round r (called on timeout): READY, gaps per sender, END, and the
+# messages stuck in the holdback (received but not delivered because a lower seq is missing)
 def describeMissing(r):
   with roundLock:
     st = r.state
     missingReady = sorted(set(range(N)) - st.ready)
     missingEnd = sorted(set(range(N)) - set(st.totals))
+    heldBack = {s: st.held(s) for s in range(N) if st.held(s)}
     gaps = {}
     for sender in range(N):
       seqs = st.received.get(sender, set())
@@ -258,7 +271,7 @@ def describeMissing(r):
       if missing:
         gaps[sender] = missing
   return ('missing READY from ' + str(missingReady) + '; gaps per sender ' + str(gaps) +
-          '; missing END from ' + str(missingEnd))
+          '; missing END from ' + str(missingEnd) + '; held back per sender ' + str(heldBack))
 
 # Function to wait for start signal from comparison server:
 def waitToStart():
@@ -322,11 +335,16 @@ while 1:
       sendReliable(addrToSend, ('END', rnd.number, myself, nMsgs))
 
     # Wait until I received everything (or timeout), and everyone acknowledged everything I
-    # sent (bounded: items are dropped after MAX_RETRIES retransmissions)
+    # sent (or timeout; items are also dropped after MAX_RETRIES retransmissions)
     timedOut = not rnd.complete.wait(ROUND_TIMEOUT)
     if not timedOut:
       with pendingCond:
-        pendingCond.wait_for(pending.empty)
+        acked = pendingCond.wait_for(pending.empty, timeout=ROUND_TIMEOUT)
+        stillPending = [] if acked else pending.keys()
+      if not acked:
+        # Do not hang: write and send the log anyway (the retransmitter keeps trying up to MAX_RETRIES)
+        print('ERROR: round ' + str(rnd.number) + ': pending sends not acknowledged after ' +
+              str(ROUND_TIMEOUT) + ' s (destination, kind, round, sender, seq): ' + str(stillPending))
 
   if timedOut:
     # Do not hang: send the partial log so that the verification reports the loss
@@ -338,9 +356,10 @@ while 1:
     duplicates = rnd.state.duplicates
     retransmissions = rnd.retransmissions
     gapsDetected = rnd.gapsDetected
+    heldBack = rnd.state.held_back
   print('Round ' + str(rnd.number) + ' finished: ' + str(len(logList)) + ' messages delivered, ' +
         str(retransmissions) + ' retransmissions, ' + str(duplicates) + ' duplicates discarded, ' +
-        str(gapsDetected) + ' gaps detected')
+        str(gapsDetected) + ' gaps detected, ' + str(heldBack) + ' held back')
 
   # Write log file
   logFile = open('logfile'+str(myself)+'.log', 'w')

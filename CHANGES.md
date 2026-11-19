@@ -142,10 +142,13 @@ comparisonServer continua sendo uma lista de tuplas `(remetente, seq)`.
   peer imprime `ERROR: giving up on ...` e desiste daquele item.
 - **Duplicatas:** o receptor responde ACK a **toda** cópia recebida (o ACK anterior pode ter
   se perdido), mas só a primeira entra no log; as outras são descartadas e contadas.
-- **Fim da rodada:** o peer só termina a rodada quando (a) recebeu `END` de todos os N e,
-  para cada remetente, todas as mensagens `0..total-1`, e (b) recebeu ACK de tudo o que
-  enviou (para garantir que os outros receberam tudo dele). Só então grava
-  `logfile<ID>.log` e envia o log.
+- **Fim da rodada:** o peer termina a rodada quando (a) recebeu `END` de todos os N e,
+  para cada remetente, todas as mensagens `0..total-1`, e (b) não há mais nada pendente do
+  que ele enviou (para garantir que os outros receberam tudo dele). Uma pendência sai da
+  lista quando chega o ACK **ou** quando o peer desiste dela depois de `MAX_RETRIES`
+  retransmissões; nesse segundo caso a rodada termina **sem** o ACK daquele item (o
+  `ERROR: giving up on ...` fica no log do peer). Só então grava `logfile<ID>.log` e envia
+  o log. (Desde o Passo 5.1 as esperas (a) e, desde o Passo 6.1, (b) também têm timeout.)
 - **Por que ACK positivo e não NACK:** com NACK o receptor só percebe uma perda quando
   chega uma mensagem posterior (lacuna). A perda da **última** mensagem de um remetente, ou
   do próprio `END`, não deixa lacuna nenhuma, então nunca seria pedida de novo sem um
@@ -289,8 +292,8 @@ das mensagens, ACK, regra de rodadas) não mudou; só foram extraídas funções
 - ~~**Mensagens de dados recebidas durante o laço de handshake são descartadas
   silenciosamente:** um peer que termina o handshake antes começa a enviar dados, e quem
   ainda está no laço de handshake ignora tudo que não é `READY`.~~ → **Resolvido no Passo 5.**
-- **Sem ordem FIFO:** com perdas e retransmissões, mensagens do mesmo remetente chegam (e
-  entram no log) fora de ordem. → Passo 6 (fila de espera).
+- ~~**Sem ordem FIFO:** com perdas e retransmissões, mensagens do mesmo remetente chegam (e
+  entram no log) fora de ordem.~~ → **Resolvido no Passo 6** (fila de espera).
 - **`recv` de tamanho fixo no TCP** (`recv(2048)`, `recv(32768)` etc.): mensagens maiores
   (ex.: logs grandes) chegam truncadas e o `pickle.loads` falha. → Passo 3 (resolvido pelo RPC).
 - **Registro duplicado e ausência de `unregister` no GroupMngr:** um peer que reinicia é
