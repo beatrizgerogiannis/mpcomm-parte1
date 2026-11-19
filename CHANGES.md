@@ -283,14 +283,98 @@ das mensagens, ACK, regra de rodadas) não mudou; só foram extraídas funções
   mesma regra de antes). Novos testes para `classify_round` (inclusive `None`) e
   `should_give_up`; `test_ack_key_matches_ack_message` usa `make_ack`/`key_from_ack`.
 
+## Passo 6 — Ordem FIFO por remetente (1b: fila de espera)
+
+Objetivo: cada peer entrega (registra no log) as mensagens de um mesmo remetente na ordem em
+que ele as enviou (0, 1, ..., nMsgs-1), mesmo com perda, retransmissão e atraso. O protocolo
+(formatos, ACK, retransmissão, rodadas) e o envio do log não mudaram: a diferença está só em
+**quando** uma mensagem recebida entra no log.
+
+### O que era / por que era problema
+- **O que era:** desde o Passo 5 o log era a ordem de **chegada**. Sem perdas e sem duplicatas,
+  mas uma mensagem retransmitida entrava no log depois de mensagens posteriores do mesmo
+  remetente.
+- **Por que era problema:** viola FIFO. Exemplo real de `docs/evidencias/fifo-antes.txt`: no
+  log do peer 0, a mensagem 7 do peer 2 aparece **antes** da 4 do mesmo peer (a 4 se perdeu e
+  só chegou na retransmissão).
+
+### Como funciona a fila de espera (reliability.py, `RoundState`)
+- Por remetente: `next_deliver[s]` (menor seq ainda não entregue, começa em 0) e
+  `holdback[s]` (seqs recebidos que esperam um menor). O `received[s]` continua guardando tudo
+  o que já chegou (entregue ou na fila) para descartar duplicatas. O antigo `next_expected`
+  (maior seq + 1) foi removido; o maior seq recebido agora sai de `highest(s)`, calculado a
+  partir de `next_deliver` e do holdback.
+- `on_data(s, seq)` devolve a lista de mensagens entregues naquela chamada:
+  - duplicata (já entregue ou já na fila) → descarta, devolve `[]`;
+  - `seq == next_deliver[s]` → entrega e continua entregando da fila enquanto houver o
+    próximo número;
+  - `seq > next_deliver[s]` → guarda no holdback, devolve `[]`, e conta em `held_back`.
+- `is_complete()`: `END` de todos, `next_deliver[s] >= total` de cada um (todas as mensagens
+  **entregues**, não só recebidas) e holdback vazio.
+- `gaps(s)`: seqs que faltam entre `next_deliver[s]` e o maior seq que está na fila (o que
+  segura a fila). `held(s)`: seqs presos na fila.
+- A intercalação **entre** remetentes continua livre: FIFO só ordena dentro de cada remetente.
+
+**Exemplo** (mensagens do peer 2, a 1 perdida na primeira transmissão):
+
+| Chega | `next_deliver[2]` antes | Ação | Entregue (log) | holdback |
+|---|---|---|---|---|
+| 0 | 0 | entrega | (2,0) | {} |
+| 2 | 1 | guarda | — | {2} |
+| 3 | 1 | guarda | — | {2, 3} |
+| 1 (retransmitida) | 1 | entrega 1 e esvazia a fila | (2,1) (2,2) (2,3) | {} |
+| 2 (duplicata) | 4 | descarta | — | {} |
+
+### peerCommunicatorUDP.py
+- O tratamento de `DATA` usa o novo retorno de `on_data`: imprime `Message k from process s`
+  para cada mensagem **entregue** (antes era na chegada) e
+  `Message k from process s put in holdback (waiting for n)` quando ela vai para a fila.
+  `Gap:` e `Late message ... fills a gap` continuam, agora calculados com `highest()`.
+- Resumo por rodada: `..., G gaps detected, X held back` (X = mensagens que passaram pela fila).
+- Timeout da rodada: a mensagem de `ERROR` também lista `held back per sender {s: [seqs]}`.
+- Nada mais mudou (protocolo, ACKs, rodadas, `sendLog`, `waitToStart`, `getListOfPeers`,
+  `registerWithGroupManager`).
+
+### Testes
+- `tests/test_reliability.py`: `test_log_keeps_arrival_order` deixou de valer e foi substituído
+  por `test_fifo_reorders_same_sender` (chegada 0, 2, 1 → log 0, 1, 2). Novos:
+  `test_fifo_reverse_arrival` (2, 1, 0: nada entregue até a 0), duplicatas de mensagem entregue
+  e de mensagem na fila, intercalação livre entre remetentes, `is_complete` falso com a fila não
+  vazia e verdadeiro depois que ela esvazia. `test_gap_detected` passou a verificar
+  `next_deliver`/`highest` no lugar de `next_expected` (removido).
+- `tests/check_logs.py`: além de perdas e duplicatas, verifica FIFO (para cada remetente, a
+  subsequência do log é exatamente 0..nMsgs-1), imprime por log o número de violações (pares
+  consecutivos do mesmo remetente com seq decrescente, com até 5 exemplos) e a data de
+  modificação do arquivo (para não dar OK com log antigo). Sai com 1 se houver violação.
+  Observação: cada rodada sobrescreve `logfile<ID>.log`, então o check vale para a **última**
+  rodada.
+
+### Resultados (Docker Compose, 6 peers, AUTO_ROUNDS=20,20, netem só no UDP 6789)
+| NETEM | Código | check_logs | Violações FIFO por log | held back por peer/rodada |
+|---|---|---|---|---|
+| `delay 20ms 10ms loss 10%`, código **antigo** (`fifo-antes.txt`) | 0 | FAILED | 6, 7, 11, 10, 8, 7 (49 no total) | — |
+| `delay 20ms 10ms loss 10%`, código **novo** (`fifo-depois.txt`) | 0 | OK | 0 em todos | 11–42 |
+| `loss 10%` | 0 | OK | 0 em todos | 15–33 |
+| (nenhum) | 0 | OK | 0 em todos | 0 |
+
+Saídas completas em `docs/evidencias/fifo-antes.txt` e `docs/evidencias/fifo-depois.txt`.
+
+### "unordered message rounds" continua acusando diferenças (esperado)
+A métrica do comparisonServer compara posição a posição o log de cada peer com o do peer 0,
+ou seja, mede **ordem total**. FIFO não é ordem total: dois peers podem intercalar de forma
+diferente mensagens de remetentes diferentes, e as duas ordens são FIFO válidas. Por isso,
+com perda/atraso, o número continua alto (117–119 de 120 nas execuções acima) mesmo com
+check_logs OK, e mesmo sem netem aparecem algumas posições diferentes (ex.: 6 e 3). Ordem
+total é da Parte 3.
+
 ## Problemas conhecidos ainda não corrigidos
 - ~~**UDP sem confirmação/retransmissão e handshake não confiável:** um `READY` ou uma
   mensagem perdida trava o peer ou deixa o log incompleto.~~ → **Resolvido no Passo 5.**
 - ~~**Mensagens de dados recebidas durante o laço de handshake são descartadas
   silenciosamente:** um peer que termina o handshake antes começa a enviar dados, e quem
   ainda está no laço de handshake ignora tudo que não é `READY`.~~ → **Resolvido no Passo 5.**
-- **Sem ordem FIFO:** com perdas e retransmissões, mensagens do mesmo remetente chegam (e
-  entram no log) fora de ordem. → Passo 6 (fila de espera).
+- ~~**Sem ordem FIFO:** com perdas e retransmissões, mensagens do mesmo remetente chegam (e
+  entram no log) fora de ordem.~~ → **Resolvido no Passo 6** (fila de espera).
 - **`recv` de tamanho fixo no TCP** (`recv(2048)`, `recv(32768)` etc.): mensagens maiores
   (ex.: logs grandes) chegam truncadas e o `pickle.loads` falha. → Passo 3 (resolvido pelo RPC).
 - **Registro duplicado e ausência de `unregister` no GroupMngr:** um peer que reinicia é

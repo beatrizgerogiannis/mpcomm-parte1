@@ -13,8 +13,8 @@ class TestRoundState(unittest.TestCase):
 
 	def test_duplicate_data_ignored(self):
 		st = RoundState(2)
-		self.assertTrue(st.on_data(1, 0))
-		self.assertFalse(st.on_data(1, 0))
+		self.assertEqual(st.on_data(1, 0), [(1, 0)])
+		self.assertEqual(st.on_data(1, 0), [])
 		self.assertEqual(st.log, [(1, 0)])
 		self.assertEqual(st.duplicates, 1)
 
@@ -38,18 +38,78 @@ class TestRoundState(unittest.TestCase):
 	def test_gap_detected(self):
 		st = RoundState(2)
 		st.on_data(1, 0)
-		self.assertEqual(st.next_expected(1), 1)
+		self.assertEqual(st.next_deliver[1], 1)
+		self.assertEqual(st.highest(1), 0)
 		st.on_data(1, 3)
+		self.assertEqual(st.highest(1), 3)
 		self.assertEqual(st.gaps(1), [1, 2])
 		st.on_data(1, 2)
 		self.assertEqual(st.gaps(1), [1])
 		self.assertEqual(st.gaps(0), [])
 
-	def test_log_keeps_arrival_order(self):
+	def test_fifo_reorders_same_sender(self):
+		# Replaces test_log_keeps_arrival_order: the log is now in FIFO order per sender
 		st = RoundState(2)
-		for (s, k) in [(1, 1), (0, 0), (1, 0)]:
+		self.assertEqual(st.on_data(1, 0), [(1, 0)])
+		self.assertEqual(st.on_data(1, 2), [])          # waits for 1
+		self.assertEqual(st.held(1), [2])
+		self.assertEqual(st.on_data(1, 1), [(1, 1), (1, 2)])
+		self.assertEqual(st.log, [(1, 0), (1, 1), (1, 2)])
+		self.assertEqual(st.held(1), [])
+		self.assertEqual(st.held_back, 1)
+
+	def test_fifo_reverse_arrival(self):
+		st = RoundState(2)
+		self.assertEqual(st.on_data(0, 2), [])
+		self.assertEqual(st.on_data(0, 1), [])
+		self.assertEqual(st.log, [])                    # nothing delivered before 0
+		self.assertEqual(st.gaps(0), [0])
+		self.assertEqual(st.on_data(0, 0), [(0, 0), (0, 1), (0, 2)])
+		self.assertEqual(st.log, [(0, 0), (0, 1), (0, 2)])
+		self.assertEqual(st.held_back, 2)
+		self.assertEqual(st.next_deliver[0], 3)
+
+	def test_duplicates_of_delivered_and_held_discarded(self):
+		st = RoundState(2)
+		st.on_data(0, 0)
+		st.on_data(0, 2)                                # held
+		self.assertTrue(st.seen(0, 0))
+		self.assertTrue(st.seen(0, 2))
+		self.assertFalse(st.seen(0, 1))
+		self.assertEqual(st.on_data(0, 0), [])          # duplicate of a delivered message
+		self.assertEqual(st.on_data(0, 2), [])          # duplicate of a held message
+		self.assertEqual(st.duplicates, 2)
+		self.assertEqual(st.held_back, 1)
+		self.assertEqual(st.on_data(0, 1), [(0, 1), (0, 2)])
+		self.assertEqual(st.log, [(0, 0), (0, 1), (0, 2)])   # each message only once
+
+	def test_fifo_interleaving_between_senders_is_free(self):
+		# FIFO only orders within each sender: the arrival interleaving between senders is kept
+		st = RoundState(2)
+		for (s, k) in [(1, 0), (0, 1), (0, 0), (1, 2), (1, 1), (0, 2)]:
 			st.on_data(s, k)
-		self.assertEqual(st.log, [(1, 1), (0, 0), (1, 0)])
+		self.assertEqual(st.log, [(1, 0), (0, 0), (0, 1), (1, 1), (1, 2), (0, 2)])
+		self.assertEqual([k for (s, k) in st.log if s == 0], [0, 1, 2])
+		self.assertEqual([k for (s, k) in st.log if s == 1], [0, 1, 2])
+
+	def test_not_complete_while_holdback_not_empty(self):
+		st = RoundState(1)
+		st.on_end(0, 2)
+		st.on_data(0, 1)                                # held: 0 missing
+		st.on_data(0, 5)                                # beyond total, also held
+		self.assertFalse(st.is_complete())
+		st.on_data(0, 0)                                # delivers 0, 1; 5 still held
+		self.assertEqual(st.log, [(0, 0), (0, 1)])
+		self.assertEqual(st.held(0), [5])
+		self.assertFalse(st.is_complete())
+
+	def test_complete_after_holdback_drains(self):
+		st = RoundState(1)
+		st.on_data(0, 1)
+		st.on_end(0, 2)
+		self.assertFalse(st.is_complete())
+		st.on_data(0, 0)
+		self.assertTrue(st.is_complete())
 
 	def test_is_complete(self):
 		st = RoundState(2)
