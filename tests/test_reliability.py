@@ -5,7 +5,8 @@ import unittest
 # Allow importing reliability.py from the repository root
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '..'))
 
-from reliability import RoundState, PendingSends, pending_key, ack_seq
+from reliability import (RoundState, PendingSends, pending_key, ack_seq, make_ack, key_from_ack,
+						 classify_round, should_give_up)
 
 
 class TestRoundState(unittest.TestCase):
@@ -83,10 +84,13 @@ class TestPendingSends(unittest.TestCase):
 		self.assertFalse(p.ack(key))   # duplicate ACK
 
 	def test_ack_key_matches_ack_message(self):
-		# The receiver builds the key from ('ACK', round, acker, kind, sender, seq)
+		# The ACK built by the receiver must remove exactly the key the sender registered
 		for msg in [('READY', 2, 0), ('DATA', 2, 0, 7), ('END', 2, 0, 20)]:
-			ack = ('ACK', msg[1], 3, msg[0], msg[2], ack_seq(msg))
-			self.assertEqual(pending_key('h', msg), ('h',) + ack[3:4] + (ack[1],) + ack[4:])
+			ack = make_ack(msg, 3)
+			self.assertEqual(ack[0], 'ACK')
+			self.assertEqual(ack[2], 3)
+			self.assertEqual(key_from_ack(ack, 'h'), pending_key('h', msg))
+		self.assertEqual(make_ack(('DATA', 2, 0, 7), 3), ('ACK', 2, 3, 'DATA', 0, 7))
 		self.assertEqual(ack_seq(('READY', 2, 0)), -1)
 		self.assertEqual(ack_seq(('END', 2, 0, 20)), -1)
 
@@ -106,6 +110,25 @@ class TestPendingSends(unittest.TestCase):
 		self.assertEqual(p.due(0.5, 0.2), [('k', b'a', 2)])
 		p.drop('k')
 		self.assertTrue(p.empty())
+
+
+class TestRoundRules(unittest.TestCase):
+
+	def test_classify_round(self):
+		self.assertEqual(classify_round(3, 3), 'current')
+		self.assertEqual(classify_round(2, 3), 'past')
+		self.assertEqual(classify_round(4, 3), 'future')
+
+	def test_classify_round_before_first_round(self):
+		# No round started yet: everything is "future" (no ACK, sender keeps retransmitting)
+		self.assertEqual(classify_round(1, None), 'future')
+
+	def test_should_give_up(self):
+		# sends = first send + retransmissions: give up after max_retries retransmissions
+		self.assertFalse(should_give_up(1, 3))
+		self.assertFalse(should_give_up(3, 3))
+		self.assertTrue(should_give_up(4, 3))
+		self.assertTrue(should_give_up(1, 0))
 
 
 if __name__ == '__main__':

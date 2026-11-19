@@ -18,6 +18,33 @@ def pending_key(dest, msg):
   return (dest, msg[0], msg[1], msg[2], ack_seq(msg))
 
 
+def make_ack(msg, acker):
+  # ACK sent by `acker` for a READY/DATA/END message
+  return ('ACK', msg[1], acker, msg[0], msg[2], ack_seq(msg))
+
+
+def key_from_ack(ack, dest):
+  # Pending key acknowledged by `ack`; dest = address the ACK came from (the original destination).
+  # Same format as pending_key(dest, msg) for the acknowledged msg.
+  (_, rnd, _acker, acked_kind, sender, seq) = ack
+  return (dest, acked_kind, rnd, sender, seq)
+
+
+def classify_round(rnd, current):
+  # Round of a received message relative to the current round number (None = no round yet).
+  # "current": process it; "past": ACK and discard; "future": discard WITHOUT ACK
+  if current is None or rnd > current:
+    return 'future'
+  if rnd < current:
+    return 'past'
+  return 'current'
+
+
+def should_give_up(sends, max_retries):
+  # sends = number of sends so far (first send + retransmissions)
+  return sends > max_retries
+
+
 class RoundState:
   # What this peer has received in the current round
 

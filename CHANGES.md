@@ -205,12 +205,83 @@ comparisonServer continua sendo uma lista de tuplas `(remetente, seq)`.
   por ela.
 - Novas variáveis repassadas: `NETEM`, `RETRANS_TIMEOUT_MS` e `MAX_RETRIES`.
 
-### Resultados (Docker Compose, 6 peers)
-| NETEM | AUTO_ROUNDS | Código de saída | check_logs | Retransmissões por peer/rodada |
-|---|---|---|---|---|
-| (nenhum) | 20,20 | 0 | OK | 0 |
-| `loss 10%` | 20,20 | 0 | OK | 19–33 |
-| `loss 30%` | 20 | 0 | OK | 111–182 |
+### Resultados (Docker Compose, 6 peers, com as correções do Passo 5.1)
+Netem só no UDP entre peers (porta 6789). Cada cenário com perda rodou 3 vezes seguidas.
+Os números da versão anterior desta tabela foram medidos com o netem na interface inteira
+(ver Passo 5.1) e foram substituídos.
+
+| NETEM | AUTO_ROUNDS | Execuções | Código de saída | check_logs | Retransmissões por peer/rodada | Linhas `ERROR` |
+|---|---|---|---|---|---|---|
+| (nenhum)¹ | 20,20 | 1 | 0 | OK | 0 | — |
+| `loss 10%` | 20,20 | 3 | 0, 0, 0 | OK ×3 | 16–38 | 0 |
+| `loss 30%` | 20,20 | 3 | 0, 0, 0 | OK ×3 | 75–139 | 0 |
+
+¹ Medido antes do Passo 5.1 e não repetido; sem `NETEM` nenhum comando `tc` é executado.
+
+Com `NETEM="isso-e-invalido"` o contêiner `peer` sai com código 1 e mostra a mensagem de uso
+do `tc` (antes rodava sem perda).
+
+## Passo 5.1 — Correções da revisão
+
+Correções encontradas na revisão técnica do Passo 5, antes do FIFO. O protocolo (formatos
+das mensagens, ACK, regra de rodadas) não mudou; só foram extraídas funções.
+
+### docker-compose.yml — netem aplicado à interface inteira
+- **O que era:** `tc qdisc add dev eth0 root netem $NETEM` colocava o netem na raiz da `eth0`,
+  então **todo** o tráfego que sai do peer sofria perda e atraso: ARP, TCP com o GroupMngr
+  (register/list), TCP com o comparisonServer (resposta ao sinal de início e envio do log).
+- **Cenário em que falhava:** com `loss 30%`, uma resposta ARP perdida fazia o `connect` falhar
+  com `No route to host`, matando a thread principal do peer; segmentos TCP perdidos atrasavam
+  muito o envio do log e o comparisonServer ficava esperando. O experimento travava ou terminava
+  com erro por motivos que não têm nada a ver com o multicast. Além disso, um `NETEM` inválido
+  só imprimia o erro do `tc` e o peer seguia rodando **sem** perda, dando um resultado "OK"
+  falso.
+- **O que mudou:** qdisc raiz `prio` (3 bandas, `priomap` mandando todo o tráfego não filtrado
+  para a banda 1:2), `netem $NETEM` só na banda 1:3, e um filtro `u32` que manda para 1:3
+  apenas UDP (`ip protocol 17`) com porta de destino 6789 (`PEER_UDP_PORT`). Todo o tráfego
+  entre peers vai para essa porta, inclusive ACKs e retransmissões (o ACK é enviado para
+  `(addr[0], PEER_UDP_PORT)`), então só ele sofre perda. O comando começa com `set -e`: se
+  qualquer `tc` falhar, o contêiner sai com erro. Quando `NETEM` está definido, o peer imprime
+  `tc qdisc show dev eth0` e `tc filter show dev eth0` ao subir, como evidência.
+  O `priomap` explícito evita que o mapeamento padrão do `prio` (baseado no TOS) mande para a
+  banda 1:3 algum tráfego que não seja do multicast.
+
+### peerCommunicatorUDP.py — esperas sem timeout
+- **O que era:** `rnd.allReady.wait()` e `rnd.complete.wait()` sem timeout.
+- **Cenário em que falhava:** se um peer desistisse de um item (`MAX_RETRIES`) ou morresse,
+  quem esperava por ele ficava bloqueado para sempre; o comparisonServer também, esperando
+  o log. Nada era reportado.
+- **O que mudou:** as duas esperas usam `ROUND_TIMEOUT_S` (padrão 120 s, repassada pelo
+  Compose). No timeout, o peer imprime `ERROR: round R timed out after T s: missing READY from
+  [...]; gaps per sender {...}; missing END from [...]` (lacunas: seqs que faltam abaixo do
+  `total` do `END`, ou abaixo do maior seq recebido quando o `END` não chegou), grava o log
+  parcial e chama `sendLog` normalmente, para a verificação acusar a perda em vez de travar.
+  Se o timeout for no handshake, o peer não envia `DATA`/`END` naquela rodada.
+
+### peerCommunicatorUDP.py — exceção derrubava as threads
+- **O que era:** `MsgHandler.run` e `Retransmitter.run` não tratavam exceções (só a de
+  `pickle.loads`).
+- **Cenário em que falhava:** qualquer exceção inesperada (ex.: uma tupla mal formada que passa
+  pelo `pickle` mas tem campos a menos, gerando `IndexError`/`ValueError`) matava a thread em
+  silêncio. Sem a receptora, o peer para de responder ACK e de receber; sem a de retransmissão,
+  nada mais é reenviado. Em ambos os casos o experimento trava.
+- **O que mudou:** cada iteração dos dois laços está num `try/except Exception` que imprime
+  `ERROR: exception in ... thread (continuing):` e o traceback completo
+  (`traceback.print_exc()`), e segue para a próxima iteração. O corpo de cada iteração virou
+  um método (`handleOne`, `checkOnce`).
+
+### reliability.py — lógica do protocolo duplicada entre o peer e os testes
+- **O que era:** a montagem do ACK, a chave extraída do ACK, a classificação da rodada e a
+  regra de desistência estavam escritas inline no peer; o teste
+  `test_ack_key_matches_ack_message` reconstruía o ACK por conta própria.
+- **Cenário em que falhava:** uma mudança no peer (ex.: ordem dos campos do ACK) não quebraria
+  nenhum teste, porque o teste verificava uma cópia da lógica e não a usada de verdade.
+- **O que mudou:** novas funções puras em `reliability.py`, usadas pelo peer e pelos testes:
+  `make_ack(msg, acker)`, `key_from_ack(ack, dest)` (mesmo formato de `pending_key`),
+  `classify_round(rnd, current)` → `"current"`/`"past"`/`"future"` (`current=None`, antes da
+  primeira rodada, dá `"future"`) e `should_give_up(sends, max_retries)` (`sends > max_retries`,
+  mesma regra de antes). Novos testes para `classify_round` (inclusive `None`) e
+  `should_give_up`; `test_ack_key_matches_ack_message` usa `make_ack`/`key_from_ack`.
 
 ## Problemas conhecidos ainda não corrigidos
 - ~~**UDP sem confirmação/retransmissão e handshake não confiável:** um `READY` ou uma
