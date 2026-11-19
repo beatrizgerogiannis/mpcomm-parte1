@@ -28,10 +28,23 @@ services:
 
   peer:
     build: .
-    # NETEM (e.g. "loss 10%" or "delay 50ms loss 10%"): applies tc netem to the peer's
-    # outgoing traffic. $$ makes Compose pass "$NETEM" to sh instead of expanding it itself.
+    # NETEM (e.g. "loss 10%" or "delay 50ms loss 10%"): applies tc netem ONLY to outgoing
+    # peer-to-peer UDP (destination port 6789 = PEER_UDP_PORT; DATA, READY, END, ACK and
+    # retransmissions all go there). ARP and TCP (group manager, comparison server) are not
+    # affected. Root prio qdisc with priomap sending all unfiltered traffic to band 1:2;
+    # netem on band 1:3; u32 filter selects UDP dport 6789 -> 1:3.
+    # set -e: an invalid NETEM makes the container fail instead of running without loss.
+    # $$ makes Compose pass "$NETEM" to sh instead of expanding it itself.
     command: >-
-      sh -c 'if [ -n "$$NETEM" ]; then tc qdisc add dev eth0 root netem $$NETEM; fi;
+      sh -c 'set -e;
+      if [ -n "$$NETEM" ]; then
+      tc qdisc add dev eth0 root handle 1: prio bands 3 priomap 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1;
+      tc qdisc add dev eth0 parent 1:3 handle 30: netem $$NETEM;
+      tc filter add dev eth0 parent 1: protocol ip prio 1 u32
+      match ip protocol 17 0xff match ip dport 6789 0xffff flowid 1:3;
+      tc qdisc show dev eth0;
+      tc filter show dev eth0;
+      fi;
       exec python /app/peerCommunicatorUDP.py'
     # Logs (logfile<ID>.log) are written to the working dir, mounted from the host
     working_dir: /app/logs
@@ -43,6 +56,7 @@ services:
       NETEM: ${NETEM:-}
       RETRANS_TIMEOUT_MS: ${RETRANS_TIMEOUT_MS:-200}
       MAX_RETRIES: ${MAX_RETRIES:-100}
+      ROUND_TIMEOUT_S: ${ROUND_TIMEOUT_S:-120}
     cap_add: [NET_ADMIN]
     depends_on: [groupmngr]
     deploy:

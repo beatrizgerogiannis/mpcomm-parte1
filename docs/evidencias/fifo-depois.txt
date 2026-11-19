@@ -1,0 +1,39 @@
+=== NETEM='delay 20ms 10ms loss 10%' AUTO_ROUNDS=20,20 N=6 (2026-11-19 13:32:52, commit 0b1036d + working tree) ===
+NETEM='delay 20ms 10ms loss 10%' código: 0
+--- comparisonServer ---
+Found 117 unordered message rounds
+Found 119 unordered message rounds
+--- python3 tests/check_logs.py 6 20 ---
+logs/logfile0.log: modified 2026-11-19 13:33:04
+logs/logfile0.log: 0 FIFO violations
+logs/logfile0.log: OK (120 entries)
+logs/logfile1.log: modified 2026-11-19 13:33:05
+logs/logfile1.log: 0 FIFO violations
+logs/logfile1.log: OK (120 entries)
+logs/logfile2.log: modified 2026-11-19 13:33:04
+logs/logfile2.log: 0 FIFO violations
+logs/logfile2.log: OK (120 entries)
+logs/logfile3.log: modified 2026-11-19 13:33:04
+logs/logfile3.log: 0 FIFO violations
+logs/logfile3.log: OK (120 entries)
+logs/logfile4.log: modified 2026-11-19 13:33:04
+logs/logfile4.log: 0 FIFO violations
+logs/logfile4.log: OK (120 entries)
+logs/logfile5.log: modified 2026-11-19 13:33:04
+logs/logfile5.log: 0 FIFO violations
+logs/logfile5.log: OK (120 entries)
+OK
+check_logs código: 0
+--- resumos por rodada (peers) ---
+peer-2  | Round 1 finished: 120 messages delivered, 29 retransmissions, 15 duplicates discarded, 8 gaps detected, 29 held back
+peer-2  | Round 2 finished: 120 messages delivered, 26 retransmissions, 22 duplicates discarded, 11 gaps detected, 25 held back
+peer-1  | Round 1 finished: 120 messages delivered, 26 retransmissions, 8 duplicates discarded, 9 gaps detected, 29 held back
+peer-3  | Round 1 finished: 120 messages delivered, 41 retransmissions, 8 duplicates discarded, 9 gaps detected, 24 held back
+peer-3  | Round 2 finished: 120 messages delivered, 34 retransmissions, 10 duplicates discarded, 4 gaps detected, 11 held back
+peer-1  | Round 2 finished: 120 messages delivered, 23 retransmissions, 8 duplicates discarded, 9 gaps detected, 24 held back
+peer-5  | Round 1 finished: 120 messages delivered, 23 retransmissions, 14 duplicates discarded, 8 gaps detected, 23 held back
+peer-6  | Round 1 finished: 120 messages delivered, 30 retransmissions, 12 duplicates discarded, 11 gaps detected, 31 held back
+peer-4  | Round 1 finished: 120 messages delivered, 27 retransmissions, 15 duplicates discarded, 12 gaps detected, 42 held back
+peer-6  | Round 2 finished: 120 messages delivered, 35 retransmissions, 15 duplicates discarded, 6 gaps detected, 15 held back
+peer-5  | Round 2 finished: 120 messages delivered, 29 retransmissions, 14 duplicates discarded, 9 gaps detected, 36 held back
+peer-4  | Round 2 finished: 120 messages delivered, 28 retransmissions, 21 duplicates discarded, 11 gaps detected, 39 held back

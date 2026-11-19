@@ -1,0 +1,39 @@
+=== NETEM='delay 20ms 10ms loss 10%' AUTO_ROUNDS=20,20 N=6 (2026-11-19 13:30:19, commit 0b1036d + working tree) ===
+NETEM='delay 20ms 10ms loss 10%' código: 0
+--- comparisonServer ---
+Found 120 unordered message rounds
+Found 120 unordered message rounds
+--- python3 tests/check_logs.py 6 20 ---
+logs/logfile0.log: modified 2026-11-19 13:30:29
+logs/logfile0.log: 6 FIFO violations (sender, earlier seq, later seq): [(2, 7, 4), (4, 6, 1), (5, 10, 4), (1, 5, 4), (4, 8, 4)]
+logs/logfile0.log: not in FIFO order per sender
+logs/logfile1.log: modified 2026-11-19 13:30:29
+logs/logfile1.log: 7 FIFO violations (sender, earlier seq, later seq): [(2, 3, 1), (2, 7, 5), (5, 15, 12), (0, 13, 10), (4, 15, 13)]
+logs/logfile1.log: not in FIFO order per sender
+logs/logfile2.log: modified 2026-11-19 13:30:29
+logs/logfile2.log: 11 FIFO violations (sender, earlier seq, later seq): [(5, 5, 1), (1, 5, 4), (1, 6, 1), (3, 12, 8), (5, 15, 13)]
+logs/logfile2.log: not in FIFO order per sender
+logs/logfile3.log: modified 2026-11-19 13:30:29
+logs/logfile3.log: 10 FIFO violations (sender, earlier seq, later seq): [(2, 3, 1), (0, 4, 0), (2, 7, 5), (5, 13, 9), (4, 11, 2)]
+logs/logfile3.log: not in FIFO order per sender
+logs/logfile4.log: modified 2026-11-19 13:30:29
+logs/logfile4.log: 8 FIFO violations (sender, earlier seq, later seq): [(3, 7, 4), (3, 10, 5), (5, 13, 4), (3, 12, 8), (2, 15, 10)]
+logs/logfile4.log: not in FIFO order per sender
+logs/logfile5.log: modified 2026-11-19 13:30:29
+logs/logfile5.log: 7 FIFO violations (sender, earlier seq, later seq): [(4, 7, 2), (0, 10, 6), (3, 11, 6), (2, 12, 8), (1, 9, 5)]
+logs/logfile5.log: not in FIFO order per sender
+FAILED
+check_logs código: 1
+--- resumos por rodada (peers) ---
+peer-2  | Round 1 finished: 120 messages delivered, 27 retransmissions, 11 duplicates discarded, 11 gaps detected
+peer-2  | Round 2 finished: 120 messages delivered, 18 retransmissions, 7 duplicates discarded, 6 gaps detected
+peer-4  | Round 1 finished: 120 messages delivered, 23 retransmissions, 15 duplicates discarded, 10 gaps detected
+peer-5  | Round 1 finished: 120 messages delivered, 29 retransmissions, 12 duplicates discarded, 7 gaps detected
+peer-4  | Round 2 finished: 120 messages delivered, 21 retransmissions, 21 duplicates discarded, 7 gaps detected
+peer-5  | Round 2 finished: 120 messages delivered, 27 retransmissions, 8 duplicates discarded, 7 gaps detected
+peer-1  | Round 1 finished: 120 messages delivered, 20 retransmissions, 11 duplicates discarded, 14 gaps detected
+peer-1  | Round 2 finished: 120 messages delivered, 28 retransmissions, 8 duplicates discarded, 9 gaps detected
+peer-3  | Round 1 finished: 120 messages delivered, 29 retransmissions, 10 duplicates discarded, 6 gaps detected
+peer-6  | Round 1 finished: 120 messages delivered, 23 retransmissions, 10 duplicates discarded, 5 gaps detected
+peer-3  | Round 2 finished: 120 messages delivered, 20 retransmissions, 13 duplicates discarded, 11 gaps detected
+peer-6  | Round 2 finished: 120 messages delivered, 24 retransmissions, 8 duplicates discarded, 7 gaps detected

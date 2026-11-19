@@ -205,12 +205,167 @@ comparisonServer continua sendo uma lista de tuplas `(remetente, seq)`.
   por ela.
 - Novas variáveis repassadas: `NETEM`, `RETRANS_TIMEOUT_MS` e `MAX_RETRIES`.
 
-### Resultados (Docker Compose, 6 peers)
-| NETEM | AUTO_ROUNDS | Código de saída | check_logs | Retransmissões por peer/rodada |
+### Resultados (Docker Compose, 6 peers, com as correções do Passo 5.1)
+Netem só no UDP entre peers (porta 6789). Cada cenário com perda rodou 3 vezes seguidas.
+Os números da versão anterior desta tabela foram medidos com o netem na interface inteira
+(ver Passo 5.1) e foram substituídos.
+
+| NETEM | AUTO_ROUNDS | Execuções | Código de saída | check_logs | Retransmissões por peer/rodada | Linhas `ERROR` |
+|---|---|---|---|---|---|---|
+| (nenhum)¹ | 20,20 | 1 | 0 | OK | 0 | — |
+| `loss 10%` | 20,20 | 3 | 0, 0, 0 | OK ×3 | 16–38 | 0 |
+| `loss 30%` | 20,20 | 3 | 0, 0, 0 | OK ×3 | 75–139 | 0 |
+
+¹ Medido antes do Passo 5.1 e não repetido; sem `NETEM` nenhum comando `tc` é executado.
+
+Com `NETEM="isso-e-invalido"` o contêiner `peer` sai com código 1 e mostra a mensagem de uso
+do `tc` (antes rodava sem perda).
+
+## Passo 5.1 — Correções da revisão
+
+Correções encontradas na revisão técnica do Passo 5, antes do FIFO. O protocolo (formatos
+das mensagens, ACK, regra de rodadas) não mudou; só foram extraídas funções.
+
+### docker-compose.yml — netem aplicado à interface inteira
+- **O que era:** `tc qdisc add dev eth0 root netem $NETEM` colocava o netem na raiz da `eth0`,
+  então **todo** o tráfego que sai do peer sofria perda e atraso: ARP, TCP com o GroupMngr
+  (register/list), TCP com o comparisonServer (resposta ao sinal de início e envio do log).
+- **Cenário em que falhava:** com `loss 30%`, uma resposta ARP perdida fazia o `connect` falhar
+  com `No route to host`, matando a thread principal do peer; segmentos TCP perdidos atrasavam
+  muito o envio do log e o comparisonServer ficava esperando. O experimento travava ou terminava
+  com erro por motivos que não têm nada a ver com o multicast. Além disso, um `NETEM` inválido
+  só imprimia o erro do `tc` e o peer seguia rodando **sem** perda, dando um resultado "OK"
+  falso.
+- **O que mudou:** qdisc raiz `prio` (3 bandas, `priomap` mandando todo o tráfego não filtrado
+  para a banda 1:2), `netem $NETEM` só na banda 1:3, e um filtro `u32` que manda para 1:3
+  apenas UDP (`ip protocol 17`) com porta de destino 6789 (`PEER_UDP_PORT`). Todo o tráfego
+  entre peers vai para essa porta, inclusive ACKs e retransmissões (o ACK é enviado para
+  `(addr[0], PEER_UDP_PORT)`), então só ele sofre perda. O comando começa com `set -e`: se
+  qualquer `tc` falhar, o contêiner sai com erro. Quando `NETEM` está definido, o peer imprime
+  `tc qdisc show dev eth0` e `tc filter show dev eth0` ao subir, como evidência.
+  O `priomap` explícito evita que o mapeamento padrão do `prio` (baseado no TOS) mande para a
+  banda 1:3 algum tráfego que não seja do multicast.
+
+### peerCommunicatorUDP.py — esperas sem timeout
+- **O que era:** `rnd.allReady.wait()` e `rnd.complete.wait()` sem timeout.
+- **Cenário em que falhava:** se um peer desistisse de um item (`MAX_RETRIES`) ou morresse,
+  quem esperava por ele ficava bloqueado para sempre; o comparisonServer também, esperando
+  o log. Nada era reportado.
+- **O que mudou:** as duas esperas usam `ROUND_TIMEOUT_S` (padrão 120 s, repassada pelo
+  Compose). No timeout, o peer imprime `ERROR: round R timed out after T s: missing READY from
+  [...]; gaps per sender {...}; missing END from [...]` (lacunas: seqs que faltam abaixo do
+  `total` do `END`, ou abaixo do maior seq recebido quando o `END` não chegou), grava o log
+  parcial e chama `sendLog` normalmente, para a verificação acusar a perda em vez de travar.
+  Se o timeout for no handshake, o peer não envia `DATA`/`END` naquela rodada.
+
+### peerCommunicatorUDP.py — exceção derrubava as threads
+- **O que era:** `MsgHandler.run` e `Retransmitter.run` não tratavam exceções (só a de
+  `pickle.loads`).
+- **Cenário em que falhava:** qualquer exceção inesperada (ex.: uma tupla mal formada que passa
+  pelo `pickle` mas tem campos a menos, gerando `IndexError`/`ValueError`) matava a thread em
+  silêncio. Sem a receptora, o peer para de responder ACK e de receber; sem a de retransmissão,
+  nada mais é reenviado. Em ambos os casos o experimento trava.
+- **O que mudou:** cada iteração dos dois laços está num `try/except Exception` que imprime
+  `ERROR: exception in ... thread (continuing):` e o traceback completo
+  (`traceback.print_exc()`), e segue para a próxima iteração. O corpo de cada iteração virou
+  um método (`handleOne`, `checkOnce`).
+
+### reliability.py — lógica do protocolo duplicada entre o peer e os testes
+- **O que era:** a montagem do ACK, a chave extraída do ACK, a classificação da rodada e a
+  regra de desistência estavam escritas inline no peer; o teste
+  `test_ack_key_matches_ack_message` reconstruía o ACK por conta própria.
+- **Cenário em que falhava:** uma mudança no peer (ex.: ordem dos campos do ACK) não quebraria
+  nenhum teste, porque o teste verificava uma cópia da lógica e não a usada de verdade.
+- **O que mudou:** novas funções puras em `reliability.py`, usadas pelo peer e pelos testes:
+  `make_ack(msg, acker)`, `key_from_ack(ack, dest)` (mesmo formato de `pending_key`),
+  `classify_round(rnd, current)` → `"current"`/`"past"`/`"future"` (`current=None`, antes da
+  primeira rodada, dá `"future"`) e `should_give_up(sends, max_retries)` (`sends > max_retries`,
+  mesma regra de antes). Novos testes para `classify_round` (inclusive `None`) e
+  `should_give_up`; `test_ack_key_matches_ack_message` usa `make_ack`/`key_from_ack`.
+
+## Passo 6 — Ordem FIFO por remetente (1b: fila de espera)
+
+Objetivo: cada peer entrega (registra no log) as mensagens de um mesmo remetente na ordem em
+que ele as enviou (0, 1, ..., nMsgs-1), mesmo com perda, retransmissão e atraso. O protocolo
+(formatos, ACK, retransmissão, rodadas) e o envio do log não mudaram: a diferença está só em
+**quando** uma mensagem recebida entra no log.
+
+### O que era / por que era problema
+- **O que era:** desde o Passo 5 o log era a ordem de **chegada**. Sem perdas e sem duplicatas,
+  mas uma mensagem retransmitida entrava no log depois de mensagens posteriores do mesmo
+  remetente.
+- **Por que era problema:** viola FIFO. Exemplo real de `docs/evidencias/fifo-antes.txt`: no
+  log do peer 0, a mensagem 7 do peer 2 aparece **antes** da 4 do mesmo peer (a 4 se perdeu e
+  só chegou na retransmissão).
+
+### Como funciona a fila de espera (reliability.py, `RoundState`)
+- Por remetente: `next_deliver[s]` (menor seq ainda não entregue, começa em 0) e
+  `holdback[s]` (seqs recebidos que esperam um menor). O `received[s]` continua guardando tudo
+  o que já chegou (entregue ou na fila) para descartar duplicatas. O antigo `next_expected`
+  (maior seq + 1) foi removido; o maior seq recebido agora sai de `highest(s)`, calculado a
+  partir de `next_deliver` e do holdback.
+- `on_data(s, seq)` devolve a lista de mensagens entregues naquela chamada:
+  - duplicata (já entregue ou já na fila) → descarta, devolve `[]`;
+  - `seq == next_deliver[s]` → entrega e continua entregando da fila enquanto houver o
+    próximo número;
+  - `seq > next_deliver[s]` → guarda no holdback, devolve `[]`, e conta em `held_back`.
+- `is_complete()`: `END` de todos, `next_deliver[s] >= total` de cada um (todas as mensagens
+  **entregues**, não só recebidas) e holdback vazio.
+- `gaps(s)`: seqs que faltam entre `next_deliver[s]` e o maior seq que está na fila (o que
+  segura a fila). `held(s)`: seqs presos na fila.
+- A intercalação **entre** remetentes continua livre: FIFO só ordena dentro de cada remetente.
+
+**Exemplo** (mensagens do peer 2, a 1 perdida na primeira transmissão):
+
+| Chega | `next_deliver[2]` antes | Ação | Entregue (log) | holdback |
 |---|---|---|---|---|
-| (nenhum) | 20,20 | 0 | OK | 0 |
-| `loss 10%` | 20,20 | 0 | OK | 19–33 |
-| `loss 30%` | 20 | 0 | OK | 111–182 |
+| 0 | 0 | entrega | (2,0) | {} |
+| 2 | 1 | guarda | — | {2} |
+| 3 | 1 | guarda | — | {2, 3} |
+| 1 (retransmitida) | 1 | entrega 1 e esvazia a fila | (2,1) (2,2) (2,3) | {} |
+| 2 (duplicata) | 4 | descarta | — | {} |
+
+### peerCommunicatorUDP.py
+- O tratamento de `DATA` usa o novo retorno de `on_data`: imprime `Message k from process s`
+  para cada mensagem **entregue** (antes era na chegada) e
+  `Message k from process s put in holdback (waiting for n)` quando ela vai para a fila.
+  `Gap:` e `Late message ... fills a gap` continuam, agora calculados com `highest()`.
+- Resumo por rodada: `..., G gaps detected, X held back` (X = mensagens que passaram pela fila).
+- Timeout da rodada: a mensagem de `ERROR` também lista `held back per sender {s: [seqs]}`.
+- Nada mais mudou (protocolo, ACKs, rodadas, `sendLog`, `waitToStart`, `getListOfPeers`,
+  `registerWithGroupManager`).
+
+### Testes
+- `tests/test_reliability.py`: `test_log_keeps_arrival_order` deixou de valer e foi substituído
+  por `test_fifo_reorders_same_sender` (chegada 0, 2, 1 → log 0, 1, 2). Novos:
+  `test_fifo_reverse_arrival` (2, 1, 0: nada entregue até a 0), duplicatas de mensagem entregue
+  e de mensagem na fila, intercalação livre entre remetentes, `is_complete` falso com a fila não
+  vazia e verdadeiro depois que ela esvazia. `test_gap_detected` passou a verificar
+  `next_deliver`/`highest` no lugar de `next_expected` (removido).
+- `tests/check_logs.py`: além de perdas e duplicatas, verifica FIFO (para cada remetente, a
+  subsequência do log é exatamente 0..nMsgs-1), imprime por log o número de violações (pares
+  consecutivos do mesmo remetente com seq decrescente, com até 5 exemplos) e a data de
+  modificação do arquivo (para não dar OK com log antigo). Sai com 1 se houver violação.
+  Observação: cada rodada sobrescreve `logfile<ID>.log`, então o check vale para a **última**
+  rodada.
+
+### Resultados (Docker Compose, 6 peers, AUTO_ROUNDS=20,20, netem só no UDP 6789)
+| NETEM | Código | check_logs | Violações FIFO por log | held back por peer/rodada |
+|---|---|---|---|---|
+| `delay 20ms 10ms loss 10%`, código **antigo** (`fifo-antes.txt`) | 0 | FAILED | 6, 7, 11, 10, 8, 7 (49 no total) | — |
+| `delay 20ms 10ms loss 10%`, código **novo** (`fifo-depois.txt`) | 0 | OK | 0 em todos | 11–42 |
+| `loss 10%` | 0 | OK | 0 em todos | 15–33 |
+| (nenhum) | 0 | OK | 0 em todos | 0 |
+
+Saídas completas em `docs/evidencias/fifo-antes.txt` e `docs/evidencias/fifo-depois.txt`.
+
+### "unordered message rounds" continua acusando diferenças (esperado)
+A métrica do comparisonServer compara posição a posição o log de cada peer com o do peer 0,
+ou seja, mede **ordem total**. FIFO não é ordem total: dois peers podem intercalar de forma
+diferente mensagens de remetentes diferentes, e as duas ordens são FIFO válidas. Por isso,
+com perda/atraso, o número continua alto (117–119 de 120 nas execuções acima) mesmo com
+check_logs OK, e mesmo sem netem aparecem algumas posições diferentes (ex.: 6 e 3). Ordem
+total é da Parte 3.
 
 ## Problemas conhecidos ainda não corrigidos
 - ~~**UDP sem confirmação/retransmissão e handshake não confiável:** um `READY` ou uma
@@ -218,8 +373,8 @@ comparisonServer continua sendo uma lista de tuplas `(remetente, seq)`.
 - ~~**Mensagens de dados recebidas durante o laço de handshake são descartadas
   silenciosamente:** um peer que termina o handshake antes começa a enviar dados, e quem
   ainda está no laço de handshake ignora tudo que não é `READY`.~~ → **Resolvido no Passo 5.**
-- **Sem ordem FIFO:** com perdas e retransmissões, mensagens do mesmo remetente chegam (e
-  entram no log) fora de ordem. → Passo 6 (fila de espera).
+- ~~**Sem ordem FIFO:** com perdas e retransmissões, mensagens do mesmo remetente chegam (e
+  entram no log) fora de ordem.~~ → **Resolvido no Passo 6** (fila de espera).
 - **`recv` de tamanho fixo no TCP** (`recv(2048)`, `recv(32768)` etc.): mensagens maiores
   (ex.: logs grandes) chegam truncadas e o `pickle.loads` falha. → Passo 3 (resolvido pelo RPC).
 - **Registro duplicado e ausência de `unregister` no GroupMngr:** um peer que reinicia é
