@@ -57,6 +57,10 @@ services:
       RETRANS_TIMEOUT_MS: ${RETRANS_TIMEOUT_MS:-200}
       MAX_RETRIES: ${MAX_RETRIES:-100}
       ROUND_TIMEOUT_S: ${ROUND_TIMEOUT_S:-120}
+      # netsim.py — software-level simulation (alternative to NETEM; default = disabled)
+      LOSS_RATE: ${LOSS_RATE:-0}
+      DELAY_MS:  ${DELAY_MS:-0}
+      JITTER_MS: ${JITTER_MS:-0}
     cap_add: [NET_ADMIN]
     depends_on: [groupmngr]
     deploy:

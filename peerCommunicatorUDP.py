@@ -7,6 +7,7 @@ import pickle
 import os
 import traceback
 from requests import get
+import netsim   # software-level network simulator (LOSS_RATE / DELAY_MS / JITTER_MS)
 
 from reliability import (RoundState, PendingSends, pending_key, make_ack, key_from_ack,
                          classify_round, should_give_up)
@@ -109,7 +110,7 @@ def sendReliable(addr, msg):
   with pendingCond:
     # Registered before sending, so that a fast ACK always finds it
     pending.add(pending_key(addr, msg), msgPack, time.monotonic())
-  sendSocket.sendto(msgPack, (addr, PEER_UDP_PORT))
+  netsim.send(sendSocket, msgPack, (addr, PEER_UDP_PORT))
 
 # Long-lived receiver thread (started once): reads the UDP socket forever, ACKs every
 # READY/DATA/END (including duplicates) and updates the state of the current round
@@ -236,7 +237,7 @@ class Retransmitter(threading.Thread):
       if pending.empty():
         pendingCond.notify_all()
     for (addr, msgPack) in toResend:
-      sendSocket.sendto(msgPack, (addr, PEER_UDP_PORT))
+      netsim.send(sendSocket, msgPack, (addr, PEER_UDP_PORT))
     if toResend:
       with roundLock:
         if currentRound is not None:
