@@ -362,20 +362,23 @@ que ele as enviou (0, 1, ..., nMsgs-1), mesmo com perda, retransmissão e atraso
 | NETEM | Código | check_logs | Violações FIFO por log | held back por peer/rodada |
 |---|---|---|---|---|
 | `delay 20ms 10ms loss 10%`, código **antigo** (`fifo-antes.txt`) | 0 | FAILED | 6, 7, 11, 10, 8, 7 (49 no total) | — |
-| `delay 20ms 10ms loss 10%`, código **novo** (`fifo-depois.txt`) | 0 | OK | 0 em todos | 11–42 |
+| `delay 20ms 10ms loss 10%`, código **novo** (`fifo-depois.txt`, commit ed5e8b9) | 0 | OK | 0 em todos | 12–44 |
 | `loss 10%` (medido, sem saída salva) | 0 | OK | 0 em todos | 15–33 |
 | (nenhum) (medido, sem saída salva) | 0 | OK | 0 em todos | 0 |
 
 Saídas completas em `docs/evidencias/fifo-antes.txt` e `docs/evidencias/fifo-depois.txt`.
 Proveniência do `fifo-antes.txt`: peer e `reliability.py` do commit 0b1036d (sem FIFO) e
 `tests/check_logs.py` do commit 7efaef5 (com a verificação FIFO); a nota está no topo do
-arquivo. O `fifo-depois.txt` será gerado de novo a partir de um commit limpo (Passo 6.1).
+arquivo. O `fifo-depois.txt` foi gerado de novo no Passo 6.1 com o `scripts/run_scenario.sh`
+a partir do commit limpo ed5e8b9 (cabeçalho `commit ed5e8b9 clean`); o código do peer,
+`reliability.py` e `tests/check_logs.py` não mudaram depois dele. A parte final dele
+(resumos por rodada) foi impressa pela versão anterior do script (`tail -n 12`).
 
 ### "unordered message rounds" continua acusando diferenças (esperado)
 A métrica do comparisonServer compara posição a posição o log de cada peer com o do peer 0,
 ou seja, mede **ordem total**. FIFO não é ordem total: dois peers podem intercalar de forma
 diferente mensagens de remetentes diferentes, e as duas ordens são FIFO válidas. Por isso,
-com perda/atraso, o número continua alto (117–119 de 120 nas execuções acima) mesmo com
+com perda/atraso, o número continua alto (120 e 119 de 120 no `fifo-depois.txt`) mesmo com
 check_logs OK, e mesmo sem netem aparecem algumas posições diferentes (ex.: 6 e 3). Ordem
 total é da Parte 3.
 
@@ -413,6 +416,21 @@ FIFO não mudaram.
     `| tee docs/evidencias/...` trunca um arquivo versionado antes da verificação
     `clean`/`dirty`, e o cabeçalho sairia sempre `dirty`.
 
+### scripts/run_scenario.sh — OK falso com erro em rodada intermediária
+- **O que era:** o script mostrava só as últimas 12 linhas de resumo (`tail -n 12`) e
+  terminava no `rm -f`, com código 0 mesmo se o `check_logs` desse FAILED.
+- **Por que era problema:** o `check_logs` só vê a **última** rodada (cada rodada sobrescreve
+  o log). Um `ERROR` (timeout, desistência após `MAX_RETRIES`) ou um `WARNING` do
+  comparisonServer (log incompleto) numa rodada anterior podia sumir da saída, e o script
+  saía com 0.
+- **O que mudou:** imprime **todas** as linhas com `finished`, `ERROR` ou `WARNING` do peer e
+  do comparison; se houver `ERROR` ou `WARNING` em qualquer rodada, imprime `FAILED: erro ou
+  aviso em alguma rodada`. O código do `check_logs` é guardado e o script termina com
+  `exit <código>`: 0 só se o compose, o `check_logs` e a busca por `ERROR`/`WARNING`
+  passarem (se o `check_logs` falhar, sai com o código dele; senão, 1 se houver
+  `ERROR`/`WARNING`). A linha `held` saiu do filtro: o `held back` já está na linha
+  `finished`, e o `held back per sender` do timeout está na linha `ERROR`.
+
 ### peerCommunicatorUDP.py — espera pelas pendências sem timeout
 - **O que era:** `pendingCond.wait_for(pending.empty)` sem timeout.
 - **Por que era problema:** era a única espera da rodada sem timeout. Ela é limitada pelo
@@ -447,12 +465,17 @@ FIFO não mudaram.
 ### docs/
 - `docs/evidencias/fifo-antes.txt`: não foi gerado de novo; ganhou no topo a nota de
   procedência (peer e `reliability.py` do commit 0b1036d, `tests/check_logs.py` do 7efaef5).
-- `docs/evidencias/fifo-depois.txt`: não alterado; será gerado de novo a partir de um commit
-  limpo com o `scripts/run_scenario.sh`.
+- `docs/evidencias/fifo-depois.txt`: gerado de novo com o `scripts/run_scenario.sh` a partir
+  do commit limpo ed5e8b9 (código que gerou a evidência; o commit cc5ef76 só versionou o
+  arquivo). Resultado: código 0, check_logs OK, 0 violações FIFO, 120 entradas por log,
+  12–44 held back por peer/rodada, 120 e 119 unordered message rounds.
 - Novo `docs/integracao-rpc.md`: guia para a integração do xmlrpc (Passo 3) com a 1b
   (tuplas → listas, `allow_none`, `start` que só enfileira, `sendLog` na thread principal,
   timeout esperando os logs, encerramento, ordem da lista, portas, `logRequests=False` e
   conflitos de merge esperados).
+  Corrigido depois: linhas da lista no `GroupMngr.py`, `ROUND_TIMEOUT_S` também no serviço
+  `comparison` e fase de envio no timeout, branch do RPC a partir da `main` atual e novo item
+  sobre `ERROR`/`WARNING` como palavras que acusam problema.
 
 ## Problemas conhecidos ainda não corrigidos
 - ~~**UDP sem confirmação/retransmissão e handshake não confiável:** um `READY` ou uma

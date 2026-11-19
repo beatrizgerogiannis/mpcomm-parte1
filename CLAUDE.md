@@ -18,6 +18,14 @@ Multicast em Python 3 que demonstra a falta de ordenação de mensagens quando o
 - GroupMngr.py — gerenciador de grupo (registro e listagem de peers)
 - comparisonServer.py — coordena o experimento e compara os logs dos peers
 - peerCommunicatorUDP.py — o peer (envio e recepção multicast via UDP)
+- reliability.py — lógica do protocolo da 1b (seq, ACK, detecção de lacunas, fila de espera FIFO)
+- tests/ — unittest (test_reliability.py, test_compare.py) e check_logs.py (perda, duplicatas,
+  violações FIFO e log antigo nos logs gerados)
+- scripts/run_scenario.sh — roda um cenário com Docker Compose (NETEM, AUTO_ROUNDS) e sai com 0
+  só se compose, check_logs e a busca por ERROR/WARNING passarem
+- docs/evidencias/ — saídas salvas (fifo-antes.txt, fifo-depois.txt)
+- docs/integracao-rpc.md — guia para integrar o RPC (Passo 3) com a 1b
+- CHANGES.md — registro de mudanças (vai para o README)
 
 ## Regras de trabalho
 - Leia os arquivos relevantes antes de editar. Não reescreva o que não foi pedido.
@@ -41,6 +49,9 @@ Multicast em Python 3 que demonstra a falta de ordenação de mensagens quando o
 - [ ] Passo 3: RPC (1a)
 - [ ] Passo 4: comparação sockets × RPC
 - [X] Passo 5: perda de mensagens (1b)
+- [X] Passo 5.1: correções da revisão do Passo 5
 - [X] Passo 6: FIFO (1b)
+- [X] Passo 6.1: ajustes de evidências e casos-limite
+- [X] Passo 6.2: OK falso no run_scenario.sh e correções da documentação
 - [ ] Passo 7: verificação no comparisonServer
 - [ ] Passo 9: README e vídeo

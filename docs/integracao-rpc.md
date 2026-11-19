@@ -33,7 +33,8 @@ def sendLog(myself, rodada, log):
 ```
 
 O mesmo vale para qualquer outra tupla que passe pelo RPC (ex.: se o `list` do GroupMngr
-devolver tuplas `(ip, porta)`; hoje ele devolve só os IPs, `GroupMngr.py:20-23`).
+devolver tuplas `(ip, porta)`; hoje ele devolve só os IPs, `GroupMngr.py:21-26`, com a lista
+montada nas linhas 22-24).
 
 ## (b) `None` exige `allow_none=True`
 
@@ -104,8 +105,14 @@ def sendLog(myself, rodada, log):   # no comparisonServer
   próprio contador, também incrementado a cada rodada que inicia.
 - **Timeout:** `waitForLogsAndCompare` deve usar `logQueue.get(timeout=...)` e, se estourar,
   imprimir `ERROR: ...` com os IDs que faltam, em vez de ficar parado para sempre. O peer espera
-  até `ROUND_TIMEOUT_S` (padrão 120 s) em cada uma das três esperas da rodada, então um valor
-  como `3 * ROUND_TIMEOUT_S + 30` cobre o pior caso.
+  até `ROUND_TIMEOUT_S` (padrão 120 s) em cada uma das três esperas da rodada e, antes delas,
+  ainda passa pela fase de envio (até 100 ms entre mensagens, ou seja, até `nMsgs × 0,1 s`).
+  Um valor como `3 * ROUND_TIMEOUT_S + nMsgs * 0.1 + 30` cobre o pior caso.
+- **`ROUND_TIMEOUT_S` no comparisonServer:** hoje o `docker-compose.yml` só passa essa
+  variável ao serviço `peer`. Para o comparisonServer usar o mesmo valor, acrescente
+  `ROUND_TIMEOUT_S: ${ROUND_TIMEOUT_S:-120}` também ao `environment` do serviço `comparison`
+  (e leia com `int(os.environ.get('ROUND_TIMEOUT_S', '120'))`), senão um teste com
+  `ROUND_TIMEOUT_S` diferente do padrão usa timeouts diferentes nos dois lados.
 
 ## (f) Encerramento com `nMsgs = 0`
 
@@ -137,7 +144,7 @@ server.server_close()
 
 - **Ordem:** o comparisonServer dá a cada peer o ID igual à **posição dele na lista** do
   GroupMngr (`startPeers`, `peerNumber`). A lista tem que sair na ordem de registro, como hoje
-  (`GroupMngr.py:20-23`, uma `list` montada de `membership`). Não troque por `set` ou `dict`
+  (`GroupMngr.py:22-24`, uma `list` montada de `membership`). Não troque por `set` ou `dict`
   sem ordem, e não ordene por IP.
 - **20 tentativas:** `registerWithGroupManager` (linhas 52-71) tenta conectar 20 vezes, com
   0,5 s entre elas, porque no Compose o peer pode subir antes do GroupMngr estar escutando.
@@ -174,6 +181,12 @@ socket é criado hoje.
 
 ## (j) Onde estão os conflitos esperados
 
+**Crie a branch do RPC a partir da `main` atual.** O `comparisonServer.py` mudou nos Passos 1
+e 2 (`AUTO_ROUNDS`, `waitForPeers`, `count_unordered_rounds`, aviso de log incompleto) e o
+`constMP.py` no Passo 1 (endereços e `N` vindos do ambiente). Uma branch que saiu do
+repositório original vai conflitar nesses arquivos também. (O `GroupMngr.py` não foi alterado
+desde o repositório original.)
+
 Se o seu branch saiu de antes do Passo 5, espere conflito de merge em:
 
 - **`peerCommunicatorUDP.py`, topo (linhas 1-38):** a 1b acrescentou imports (`traceback`,
@@ -189,10 +202,21 @@ Se o seu branch saiu de antes do Passo 5, espere conflito de merge em:
   `MsgHandler.run()`, descarte essa versão: a thread receptora da 1b não envia log.
 - **`CHANGES.md`:** os dois lados acrescentam seções; mantenha as duas, na ordem dos passos.
 - **Não deve haver conflito** em `comparisonServer.py`, `GroupMngr.py`, `constMP.py` e
-  `reliability.py`: a 1b não mexeu nos três primeiros depois do Passo 2, e o RPC não precisa
-  mexer no último.
+  `reliability.py` **se a branch partir da `main` atual**: a 1b não mexeu nos três primeiros
+  depois do Passo 2, e o RPC não precisa mexer no último.
 
-## (k) `logRequests=False`
+## (k) `ERROR` e `WARNING` são as palavras que acusam problema
+
+O comparisonServer imprime `WARNING: log i has X messages, expected Y` quando um log chega
+incompleto (`comparisonServer.py:113`), e os peers imprimem `ERROR: ...` em timeouts e
+desistências. O `scripts/run_scenario.sh` procura essas duas palavras em **todas** as rodadas
+(peer e comparison) e falha com `FAILED: erro ou aviso em alguma rodada` se achar alguma,
+mesmo que o `check_logs` da última rodada dê OK. Ao trocar o transporte, mantenha essas
+mensagens (e use `ERROR` no timeout de `waitForLogsAndCompare`, item (e)). A verificação nova
+do Passo 7 (FIFO e ausência de perdas no comparisonServer) deve acusar problema com uma
+dessas palavras, para o script pegar.
+
+## (l) `logRequests=False`
 
 Por padrão o `SimpleXMLRPCServer` imprime uma linha por requisição
 (`"POST /RPC2 HTTP/1.1" 200 -`). O `waitForPeers` chama `list` a cada 0,5 s, e cada rodada
