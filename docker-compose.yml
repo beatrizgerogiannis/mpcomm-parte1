@@ -28,7 +28,11 @@ services:
 
   peer:
     build: .
-    command: python /app/peerCommunicatorUDP.py
+    # NETEM (e.g. "loss 10%" or "delay 50ms loss 10%"): applies tc netem to the peer's
+    # outgoing traffic. $$ makes Compose pass "$NETEM" to sh instead of expanding it itself.
+    command: >-
+      sh -c 'if [ -n "$$NETEM" ]; then tc qdisc add dev eth0 root netem $$NETEM; fi;
+      exec python /app/peerCommunicatorUDP.py'
     # Logs (logfile<ID>.log) are written to the working dir, mounted from the host
     working_dir: /app/logs
     volumes:
@@ -36,6 +40,9 @@ services:
     environment:
       <<: *common-env
       PEER_IP_MODE: local
+      NETEM: ${NETEM:-}
+      RETRANS_TIMEOUT_MS: ${RETRANS_TIMEOUT_MS:-200}
+      MAX_RETRIES: ${MAX_RETRIES:-100}
     cap_add: [NET_ADMIN]
     depends_on: [groupmngr]
     deploy:
