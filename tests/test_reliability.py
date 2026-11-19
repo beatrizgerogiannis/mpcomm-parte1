@@ -94,9 +94,9 @@ class TestRoundState(unittest.TestCase):
 
 	def test_not_complete_while_holdback_not_empty(self):
 		st = RoundState(1)
-		st.on_end(0, 2)
 		st.on_data(0, 1)                                # held: 0 missing
-		st.on_data(0, 5)                                # beyond total, also held
+		st.on_data(0, 5)                                # beyond total, but arrives before the END: held
+		st.on_end(0, 2)
 		self.assertFalse(st.is_complete())
 		st.on_data(0, 0)                                # delivers 0, 1; 5 still held
 		self.assertEqual(st.log, [(0, 0), (0, 1)])
@@ -109,6 +109,30 @@ class TestRoundState(unittest.TestCase):
 		st.on_end(0, 2)
 		self.assertFalse(st.is_complete())
 		st.on_data(0, 0)
+		self.assertTrue(st.is_complete())
+
+	def test_negative_seq_discarded(self):
+		st = RoundState(1)
+		self.assertEqual(st.on_data(0, -1), [])
+		self.assertEqual(st.held(0), [])
+		self.assertFalse(st.seen(0, -1))
+		self.assertEqual(st.invalid, 1)
+		self.assertEqual(st.duplicates, 0)
+		self.assertEqual(st.on_data(0, 0), [(0, 0)])   # normal delivery unaffected
+		self.assertEqual(st.log, [(0, 0)])
+
+	def test_seq_beyond_total_discarded_after_end(self):
+		st = RoundState(1)
+		self.assertTrue(st.valid_seq(0, 7))             # END not received yet: total unknown
+		st.on_end(0, 2)
+		self.assertFalse(st.valid_seq(0, 2))
+		self.assertEqual(st.on_data(0, 2), [])          # seq == total
+		self.assertEqual(st.on_data(0, 9), [])          # seq > total
+		self.assertEqual(st.held(0), [])                # nothing stuck in the holdback
+		self.assertEqual(st.invalid, 2)
+		st.on_data(0, 1)
+		st.on_data(0, 0)
+		self.assertEqual(st.log, [(0, 0), (0, 1)])
 		self.assertTrue(st.is_complete())
 
 	def test_is_complete(self):
@@ -142,6 +166,14 @@ class TestPendingSends(unittest.TestCase):
 		self.assertTrue(p.ack(key))
 		self.assertTrue(p.empty())
 		self.assertFalse(p.ack(key))   # duplicate ACK
+
+	def test_keys_lists_pending(self):
+		p = PendingSends()
+		p.add(('h', 'DATA', 1, 0, 2), b'a', 0.0)
+		p.add(('h', 'END', 1, 0, -1), b'b', 0.0)
+		self.assertEqual(len(p.keys()), 2)
+		p.ack(('h', 'END', 1, 0, -1))
+		self.assertEqual(p.keys(), [('h', 'DATA', 1, 0, 2)])
 
 	def test_ack_key_matches_ack_message(self):
 		# The ACK built by the receiver must remove exactly the key the sender registered

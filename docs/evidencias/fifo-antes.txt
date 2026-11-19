@@ -1,3 +1,4 @@
+Peer e reliability.py do commit 0b1036d (sem FIFO); tests/check_logs.py do commit 7efaef5 (com a verificação FIFO).
 === NETEM='delay 20ms 10ms loss 10%' AUTO_ROUNDS=20,20 N=6 (2026-11-19 13:30:19, commit 0b1036d + working tree) ===
 NETEM='delay 20ms 10ms loss 10%' código: 0
 --- comparisonServer ---

@@ -61,6 +61,7 @@ class RoundState:
     self.log = []           # delivered messages (sender, seq), in delivery (FIFO) order
     self.duplicates = 0     # duplicates discarded (READY, DATA and END)
     self.held_back = 0      # DATA messages that went through the holdback
+    self.invalid = 0        # DATA discarded for an impossible seq (see valid_seq)
 
   def on_ready(self, sender):
     # True if this handshake is new
@@ -74,9 +75,21 @@ class RoundState:
     # True if (sender, seq) was already received (delivered or in the holdback)
     return seq in self.received.get(sender, ())
 
+  def valid_seq(self, sender, seq):
+    # False for a seq that can never be delivered: negative, or >= the total announced in the
+    # sender's END (only known after the END arrives). Such a message would stay in the holdback
+    # forever and the round would never complete.
+    if seq < 0:
+      return False
+    total = self.totals.get(sender)
+    return total is None or seq < total
+
   def on_data(self, sender, seq):
     # Returns the list of messages (sender, seq) delivered by this call, in order: empty if the
-    # message is a duplicate or was put in the holdback
+    # message is a duplicate, has an invalid seq (discarded, see valid_seq) or was put in the holdback
+    if not self.valid_seq(sender, seq):
+      self.invalid += 1
+      return []
     seqs = self.received.setdefault(sender, set())
     if seq in seqs:
       self.duplicates += 1
@@ -166,6 +179,10 @@ class PendingSends:
 
   def empty(self):
     return not self._items
+
+  def keys(self):
+    # Pending keys, sorted (for error messages)
+    return sorted(self._items, key=repr)
 
   def __len__(self):
     return len(self._items)
