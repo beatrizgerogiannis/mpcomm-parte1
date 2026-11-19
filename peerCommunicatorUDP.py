@@ -5,14 +5,19 @@ import random
 import time
 import pickle
 import os
+import traceback
 from requests import get
 
-from reliability import RoundState, PendingSends, pending_key, ack_seq
+from reliability import (RoundState, PendingSends, pending_key, make_ack, key_from_ack,
+                         classify_round, should_give_up)
 
 # Reliable delivery (positive ACK + retransmission by timeout; see reliability.py)
 RETRANS_TIMEOUT = int(os.environ.get('RETRANS_TIMEOUT_MS', 200)) / 1000  # seconds
 MAX_RETRIES = int(os.environ.get('MAX_RETRIES', 100))  # retransmissions per item
 RETRANS_CHECK_INTERVAL = 0.05  # seconds
+# Max wait (seconds) for the handshakes and for the end of the round; on timeout the partial
+# log is written and sent anyway, so the comparison server reports the loss instead of hanging
+ROUND_TIMEOUT = float(os.environ.get('ROUND_TIMEOUT_S', 120))
 
 PEERS = []
 
@@ -116,28 +121,35 @@ class MsgHandler(threading.Thread):
   def run(self):
     print('Handler is ready. Waiting for messages...')
     while True:
-      msgPack, addr = self.sock.recvfrom(1024)
+      # An exception must not kill the thread (the peer would stop receiving and ACKing)
       try:
-        msg = pickle.loads(msgPack)
-      except Exception as e:
-        print('Discarded invalid packet from ', addr, ': ', e)
-        continue
-      if msg[0] == 'ACK':
-        self.handleAck(msg, addr)
-      elif msg[0] in ('READY', 'DATA', 'END'):
-        self.handleMessage(msg, addr)
-      else:
-        print('Discarded unknown message from ', addr, ': ', msg)
+        self.handleOne()
+      except Exception:
+        print('ERROR: exception in receiver thread (continuing):')
+        traceback.print_exc()
+
+  def handleOne(self):
+    msgPack, addr = self.sock.recvfrom(1024)
+    try:
+      msg = pickle.loads(msgPack)
+    except Exception as e:
+      print('Discarded invalid packet from ', addr, ': ', e)
+      return
+    if msg[0] == 'ACK':
+      self.handleAck(msg, addr)
+    elif msg[0] in ('READY', 'DATA', 'END'):
+      self.handleMessage(msg, addr)
+    else:
+      print('Discarded unknown message from ', addr, ': ', msg)
 
   def handleAck(self, msg, addr):
     # ('ACK', round, acker, ackedKind, sender, seq): the acker is the destination of the original
-    (_, rnd, acker, ackedKind, sender, seq) = msg
     with pendingCond:
-      if pending.ack((addr[0], ackedKind, rnd, sender, seq)) and pending.empty():
+      if pending.ack(key_from_ack(msg, addr[0])) and pending.empty():
         pendingCond.notify_all()
 
   def sendAck(self, msg, addr, myself):
-    ack = ('ACK', msg[1], myself, msg[0], msg[2], ack_seq(msg))
+    ack = make_ack(msg, myself)
     # ACKs go to the receive port of the sender (handled by its receiver thread)
     sendSocket.sendto(pickle.dumps(ack), (addr[0], PEER_UDP_PORT))
 
@@ -147,12 +159,13 @@ class MsgHandler(threading.Thread):
     sender = msg[2]
     with roundLock:
       r = currentRound
-      if r is None or rnd > r.number:
+      which = classify_round(rnd, r.number if r is not None else None)
+      if which == 'future':
         # Future round (the sender got its start signal before us): no ACK, so the sender
         # keeps retransmitting until we enter that round
         return
       self.sendAck(msg, addr, r.myself)
-      if rnd < r.number:
+      if which == 'past':
         # Retransmission of an old round whose ACK was lost: the ACK above stops it
         print('Discarded ' + kind + ' from process ' + str(sender) + ' of old round ' + str(rnd))
         return
@@ -191,25 +204,33 @@ class Retransmitter(threading.Thread):
   def run(self):
     while True:
       time.sleep(RETRANS_CHECK_INTERVAL)
-      now = time.monotonic()
-      toResend = []
-      with pendingCond:
-        for (key, msgPack, sends) in pending.due(now, RETRANS_TIMEOUT):
-          if sends > MAX_RETRIES:
-            pending.drop(key)
-            print('ERROR: giving up on ' + str(key) + ' after ' + str(MAX_RETRIES) +
-                  ' retransmissions without ACK (destination, kind, round, sender, seq)')
-          else:
-            pending.mark_resent(key, now)
-            toResend.append((key[0], msgPack))
-        if pending.empty():
-          pendingCond.notify_all()
-      for (addr, msgPack) in toResend:
-        sendSocket.sendto(msgPack, (addr, PEER_UDP_PORT))
-      if toResend:
-        with roundLock:
-          if currentRound is not None:
-            currentRound.retransmissions += len(toResend)
+      # An exception must not kill the thread (nothing would be retransmitted anymore)
+      try:
+        self.checkOnce()
+      except Exception:
+        print('ERROR: exception in retransmission thread (continuing):')
+        traceback.print_exc()
+
+  def checkOnce(self):
+    now = time.monotonic()
+    toResend = []
+    with pendingCond:
+      for (key, msgPack, sends) in pending.due(now, RETRANS_TIMEOUT):
+        if should_give_up(sends, MAX_RETRIES):
+          pending.drop(key)
+          print('ERROR: giving up on ' + str(key) + ' after ' + str(MAX_RETRIES) +
+                ' retransmissions without ACK (destination, kind, round, sender, seq)')
+        else:
+          pending.mark_resent(key, now)
+          toResend.append((key[0], msgPack))
+      if pending.empty():
+        pendingCond.notify_all()
+    for (addr, msgPack) in toResend:
+      sendSocket.sendto(msgPack, (addr, PEER_UDP_PORT))
+    if toResend:
+      with roundLock:
+        if currentRound is not None:
+          currentRound.retransmissions += len(toResend)
 
 # Body moved unchanged from the end of the old MsgHandler.run()
 def sendLog(logList):
@@ -220,6 +241,24 @@ def sendLog(logList):
   msgPack = pickle.dumps(logList)
   clientSock.send(msgPack)
   clientSock.close()
+
+# Describes what is missing in round r (called on timeout): READY, gaps per sender, END
+def describeMissing(r):
+  with roundLock:
+    st = r.state
+    missingReady = sorted(set(range(N)) - st.ready)
+    missingEnd = sorted(set(range(N)) - set(st.totals))
+    gaps = {}
+    for sender in range(N):
+      seqs = st.received.get(sender, set())
+      if sender in st.totals:
+        missing = [k for k in range(st.totals[sender]) if k not in seqs]
+      else:
+        missing = st.gaps(sender)   # total unknown: only the holes below the highest seq
+      if missing:
+        gaps[sender] = missing
+  return ('missing READY from ' + str(missingReady) + '; gaps per sender ' + str(gaps) +
+          '; missing END from ' + str(missingEnd))
 
 # Function to wait for start signal from comparison server:
 def waitToStart():
@@ -265,26 +304,34 @@ while 1:
 
   print('Main Thread: Sent all handshakes. handShakeCount=', str(len(rnd.state.ready)))
 
-  # Block until the receiver thread has received all handshakes
-  rnd.allReady.wait()
-  print('Main Thread: Received all handshakes. Sending data messages.')
+  # Block until the receiver thread has received all handshakes (or timeout)
+  timedOut = not rnd.allReady.wait(ROUND_TIMEOUT)
+  if not timedOut:
+    print('Main Thread: Received all handshakes. Sending data messages.')
 
-  # Send a sequence of data messages to all other processes
-  for msgNumber in range(0, nMsgs):
-    # Wait some random time between successive messages
-    time.sleep(random.randrange(10,100)/1000)
+    # Send a sequence of data messages to all other processes
+    for msgNumber in range(0, nMsgs):
+      # Wait some random time between successive messages
+      time.sleep(random.randrange(10,100)/1000)
+      for addrToSend in PEERS:
+        sendReliable(addrToSend, ('DATA', rnd.number, myself, msgNumber))
+        print('Sent message ' + str(msgNumber))
+
+    # Tell all processes that I have no more messages to send (and how many I sent)
     for addrToSend in PEERS:
-      sendReliable(addrToSend, ('DATA', rnd.number, myself, msgNumber))
-      print('Sent message ' + str(msgNumber))
+      sendReliable(addrToSend, ('END', rnd.number, myself, nMsgs))
 
-  # Tell all processes that I have no more messages to send (and how many I sent)
-  for addrToSend in PEERS:
-    sendReliable(addrToSend, ('END', rnd.number, myself, nMsgs))
+    # Wait until I received everything (or timeout), and everyone acknowledged everything I
+    # sent (bounded: items are dropped after MAX_RETRIES retransmissions)
+    timedOut = not rnd.complete.wait(ROUND_TIMEOUT)
+    if not timedOut:
+      with pendingCond:
+        pendingCond.wait_for(pending.empty)
 
-  # Wait until I received everything, and everyone acknowledged everything I sent
-  rnd.complete.wait()
-  with pendingCond:
-    pendingCond.wait_for(pending.empty)
+  if timedOut:
+    # Do not hang: send the partial log so that the verification reports the loss
+    print('ERROR: round ' + str(rnd.number) + ' timed out after ' + str(ROUND_TIMEOUT) + ' s: ' +
+          describeMissing(rnd))
 
   with roundLock:
     logList = list(rnd.state.log)
