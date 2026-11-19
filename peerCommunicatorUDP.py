@@ -7,10 +7,12 @@ import pickle
 import os
 from requests import get
 
-#handShakes = [] # not used; only if we need to check whose handshake is missing
+from reliability import RoundState, PendingSends, pending_key, ack_seq
 
-# Set by the handler thread when its handShakeCount reaches N (recreated every round)
-allHandshakesReceived = threading.Event()
+# Reliable delivery (positive ACK + retransmission by timeout; see reliability.py)
+RETRANS_TIMEOUT = int(os.environ.get('RETRANS_TIMEOUT_MS', 200)) / 1000  # seconds
+MAX_RETRIES = int(os.environ.get('MAX_RETRIES', 100))  # retransmissions per item
+RETRANS_CHECK_INTERVAL = 0.05  # seconds
 
 PEERS = []
 
@@ -77,65 +79,147 @@ def getListOfPeers():
   clientSock.close()
   return PEERS
 
+# State of one round, shared by the main thread and the receiver thread (guarded by roundLock)
+class Round:
+  def __init__(self, number, myself):
+    self.number = number      # local round counter (incremented at every start signal)
+    self.myself = myself      # my ID in this round
+    self.state = RoundState(N)
+    self.allReady = threading.Event()   # set when handshakes from all N peers were received
+    self.complete = threading.Event()   # set when all messages and ENDs were received
+    self.retransmissions = 0
+    self.gapsDetected = 0
+
+roundLock = threading.Lock()
+currentRound = None   # Round being executed (None before the first start signal)
+roundNumber = 0
+
+# Messages sent and not yet acknowledged (guarded by pendingCond, notified when it empties)
+pending = PendingSends()
+pendingCond = threading.Condition()
+
+# Send msg to addr and keep it pending until the ACK arrives (retransmitted by Retransmitter)
+def sendReliable(addr, msg):
+  msgPack = pickle.dumps(msg)
+  with pendingCond:
+    # Registered before sending, so that a fast ACK always finds it
+    pending.add(pending_key(addr, msg), msgPack, time.monotonic())
+  sendSocket.sendto(msgPack, (addr, PEER_UDP_PORT))
+
+# Long-lived receiver thread (started once): reads the UDP socket forever, ACKs every
+# READY/DATA/END (including duplicates) and updates the state of the current round
 class MsgHandler(threading.Thread):
-  def __init__(self, sock, myself):
-    threading.Thread.__init__(self)
+  def __init__(self, sock):
+    threading.Thread.__init__(self, daemon=True)
     self.sock = sock
-    self.myself = myself
-    # Counter to make sure we have received handshakes from all other processes
-    self.handShakeCount = 0
 
   def run(self):
-    print('Handler is ready. Waiting for the handshakes...')
-    
-    #global handShakes
-    
-    logList = []
-    
-    # Wait until handshakes are received from all other processes
-    # (to make sure that all processes are synchronized before they start exchanging messages)
-    while self.handShakeCount < N:
-      msgPack = self.sock.recv(1024)
-      msg = pickle.loads(msgPack)
-      #print ('########## unpickled msgPack: ', msg)
-      if msg[0] == 'READY':
-
-        # To do: send reply of handshake and wait for confirmation
-
-        self.handShakeCount = self.handShakeCount + 1
-        #handShakes[msg[1]] = 1
-        print('--- Handshake received: ', msg[1])
-        if self.handShakeCount == N:
-          allHandshakesReceived.set()
-
-    print('Secondary Thread: Received all handshakes. Entering the loop to receive messages.')
-
-    stopCount=0 
-    while True:                
-      msgPack = self.sock.recv(1024)   # receive data from client
-      msg = pickle.loads(msgPack)
-      if msg[0] == -1:   # count the 'stop' messages from the other processes
-        stopCount = stopCount + 1
-        if stopCount == N:
-          break  # stop loop when all other processes have finished
+    print('Handler is ready. Waiting for messages...')
+    while True:
+      msgPack, addr = self.sock.recvfrom(1024)
+      try:
+        msg = pickle.loads(msgPack)
+      except Exception as e:
+        print('Discarded invalid packet from ', addr, ': ', e)
+        continue
+      if msg[0] == 'ACK':
+        self.handleAck(msg, addr)
+      elif msg[0] in ('READY', 'DATA', 'END'):
+        self.handleMessage(msg, addr)
       else:
-        print('Message ' + str(msg[1]) + ' from process ' + str(msg[0]))
-        logList.append(msg)
-        
-    # Write log file
-    logFile = open('logfile'+str(self.myself)+'.log', 'w')
-    logFile.writelines(str(logList))
-    logFile.close()
-    
-    # Send the list of messages to the server (using a TCP socket) for comparison
-    print('Sending the list of messages to the server for comparison...')
-    clientSock = socket(AF_INET, SOCK_STREAM)
-    clientSock.connect((SERVER_ADDR, SERVER_PORT))
-    msgPack = pickle.dumps(logList)
-    clientSock.send(msgPack)
-    clientSock.close()
+        print('Discarded unknown message from ', addr, ': ', msg)
 
-    exit(0)
+  def handleAck(self, msg, addr):
+    # ('ACK', round, acker, ackedKind, sender, seq): the acker is the destination of the original
+    (_, rnd, acker, ackedKind, sender, seq) = msg
+    with pendingCond:
+      if pending.ack((addr[0], ackedKind, rnd, sender, seq)) and pending.empty():
+        pendingCond.notify_all()
+
+  def sendAck(self, msg, addr, myself):
+    ack = ('ACK', msg[1], myself, msg[0], msg[2], ack_seq(msg))
+    # ACKs go to the receive port of the sender (handled by its receiver thread)
+    sendSocket.sendto(pickle.dumps(ack), (addr[0], PEER_UDP_PORT))
+
+  def handleMessage(self, msg, addr):
+    kind = msg[0]
+    rnd = msg[1]
+    sender = msg[2]
+    with roundLock:
+      r = currentRound
+      if r is None or rnd > r.number:
+        # Future round (the sender got its start signal before us): no ACK, so the sender
+        # keeps retransmitting until we enter that round
+        return
+      self.sendAck(msg, addr, r.myself)
+      if rnd < r.number:
+        # Retransmission of an old round whose ACK was lost: the ACK above stops it
+        print('Discarded ' + kind + ' from process ' + str(sender) + ' of old round ' + str(rnd))
+        return
+      st = r.state
+      if kind == 'READY':
+        if st.on_ready(sender):
+          print('--- Handshake received: ', sender)
+        else:
+          print('Duplicate handshake from process ' + str(sender) + ' discarded')
+        if st.all_ready():
+          r.allReady.set()
+      elif kind == 'DATA':
+        seq = msg[3]
+        expected = st.next_expected(sender)
+        if st.on_data(sender, seq):
+          if seq > expected:
+            r.gapsDetected += 1
+            print('Gap: from process ' + str(sender) + ' expected ' + str(expected) + ', got ' + str(seq))
+          elif seq < expected:
+            print('Late message ' + str(seq) + ' from process ' + str(sender) + ' fills a gap')
+          print('Message ' + str(seq) + ' from process ' + str(sender))
+        else:
+          print('Duplicate message ' + str(seq) + ' from process ' + str(sender) + ' discarded')
+      elif kind == 'END':
+        if not st.on_end(sender, msg[3]):
+          print('Duplicate END from process ' + str(sender) + ' discarded')
+      if st.is_complete():
+        r.complete.set()
+
+# Retransmission thread (started once): every 50 ms, resends what was not acknowledged
+# within RETRANS_TIMEOUT; gives up on an item after MAX_RETRIES retransmissions
+class Retransmitter(threading.Thread):
+  def __init__(self):
+    threading.Thread.__init__(self, daemon=True)
+
+  def run(self):
+    while True:
+      time.sleep(RETRANS_CHECK_INTERVAL)
+      now = time.monotonic()
+      toResend = []
+      with pendingCond:
+        for (key, msgPack, sends) in pending.due(now, RETRANS_TIMEOUT):
+          if sends > MAX_RETRIES:
+            pending.drop(key)
+            print('ERROR: giving up on ' + str(key) + ' after ' + str(MAX_RETRIES) +
+                  ' retransmissions without ACK (destination, kind, round, sender, seq)')
+          else:
+            pending.mark_resent(key, now)
+            toResend.append((key[0], msgPack))
+        if pending.empty():
+          pendingCond.notify_all()
+      for (addr, msgPack) in toResend:
+        sendSocket.sendto(msgPack, (addr, PEER_UDP_PORT))
+      if toResend:
+        with roundLock:
+          if currentRound is not None:
+            currentRound.retransmissions += len(toResend)
+
+# Body moved unchanged from the end of the old MsgHandler.run()
+def sendLog(logList):
+  # Send the list of messages to the server (using a TCP socket) for comparison
+  print('Sending the list of messages to the server for comparison...')
+  clientSock = socket(AF_INET, SOCK_STREAM)
+  clientSock.connect((SERVER_ADDR, SERVER_PORT))
+  msgPack = pickle.dumps(logList)
+  clientSock.send(msgPack)
+  clientSock.close()
 
 # Function to wait for start signal from comparison server:
 def waitToStart():
@@ -150,6 +234,12 @@ def waitToStart():
 
 # From here, code is executed when program starts:
 registerWithGroupManager()
+
+# Receiver and retransmission threads live for the whole process (not one per round)
+MsgHandler(recvSocket).start()
+Retransmitter().start()
+print('Handler started')
+
 while 1:
   print('Waiting for signal to start...')
   (myself, nMsgs) = waitToStart()
@@ -159,43 +249,55 @@ while 1:
     print('Terminating.')
     exit(0)
 
-  # New event for this round (the previous one is already set)
-  allHandshakesReceived = threading.Event()
-
-  # Create receiving message handler
-  msgHandler = MsgHandler(recvSocket, myself)
-  msgHandler.start()
-  print('Handler started')
+  # New round: messages of other rounds are no longer accepted
+  with roundLock:
+    roundNumber = roundNumber + 1
+    currentRound = Round(roundNumber, myself)
+    rnd = currentRound
+  print('Starting round ' + str(rnd.number))
 
   PEERS = getListOfPeers()
-  
-  # Send handshakes
-  # To do: Must continue sending until it gets a reply from each process
-  #        Send confirmation of reply
+
+  # Send handshakes (reliably: retransmitted until each peer acknowledges)
   for addrToSend in PEERS:
     print('Sending handshake to ', addrToSend)
-    msg = ('READY', myself)
-    msgPack = pickle.dumps(msg)
-    sendSocket.sendto(msgPack, (addrToSend,PEER_UDP_PORT))
-    #data = recvSocket.recvfrom(128) # Handshadke confirmations have not yet been implemented
+    sendReliable(addrToSend, ('READY', rnd.number, myself))
 
-  print('Main Thread: Sent all handshakes. handShakeCount=', str(msgHandler.handShakeCount))
+  print('Main Thread: Sent all handshakes. handShakeCount=', str(len(rnd.state.ready)))
 
-  # Block until the handler thread has received all handshakes
-  allHandshakesReceived.wait()
+  # Block until the receiver thread has received all handshakes
+  rnd.allReady.wait()
+  print('Main Thread: Received all handshakes. Sending data messages.')
 
-  # Send a sequence of data messages to all other processes 
+  # Send a sequence of data messages to all other processes
   for msgNumber in range(0, nMsgs):
     # Wait some random time between successive messages
     time.sleep(random.randrange(10,100)/1000)
-    msg = (myself, msgNumber)
-    msgPack = pickle.dumps(msg)
     for addrToSend in PEERS:
-      sendSocket.sendto(msgPack, (addrToSend,PEER_UDP_PORT))
+      sendReliable(addrToSend, ('DATA', rnd.number, myself, msgNumber))
       print('Sent message ' + str(msgNumber))
 
-  # Tell all processes that I have no more messages to send
+  # Tell all processes that I have no more messages to send (and how many I sent)
   for addrToSend in PEERS:
-    msg = (-1,-1)
-    msgPack = pickle.dumps(msg)
-    sendSocket.sendto(msgPack, (addrToSend,PEER_UDP_PORT))
+    sendReliable(addrToSend, ('END', rnd.number, myself, nMsgs))
+
+  # Wait until I received everything, and everyone acknowledged everything I sent
+  rnd.complete.wait()
+  with pendingCond:
+    pendingCond.wait_for(pending.empty)
+
+  with roundLock:
+    logList = list(rnd.state.log)
+    duplicates = rnd.state.duplicates
+    retransmissions = rnd.retransmissions
+    gapsDetected = rnd.gapsDetected
+  print('Round ' + str(rnd.number) + ' finished: ' + str(len(logList)) + ' messages delivered, ' +
+        str(retransmissions) + ' retransmissions, ' + str(duplicates) + ' duplicates discarded, ' +
+        str(gapsDetected) + ' gaps detected')
+
+  # Write log file
+  logFile = open('logfile'+str(myself)+'.log', 'w')
+  logFile.writelines(str(logList))
+  logFile.close()
+
+  sendLog(logList)
