@@ -6,6 +6,7 @@ import time
 import pickle
 import os
 import xmlrpc.client
+from xmlrpc.server import SimpleXMLRPCServer
 from requests import get
 
 #handShakes = [] # not used; only if we need to check whose handshake is missing
@@ -25,13 +26,6 @@ recvSocket = socket(AF_INET, SOCK_DGRAM)
 recvSocket.setsockopt(SOL_SOCKET, SO_REUSEADDR, 1)
 recvSocket.bind(('0.0.0.0', PEER_UDP_PORT))
 
-# TCP socket to receive start signal from the comparison server:
-serverSock = socket(AF_INET, SOCK_STREAM)
-# Allow immediate reuse of the port after closing
-serverSock.setsockopt(SOL_SOCKET, SO_REUSEADDR, 1)
-serverSock.bind(('0.0.0.0', PEER_TCP_PORT))
-serverSock.listen(1)
-
 
 def get_public_ip():
   # PEER_IP_MODE=local: use the container/host IP instead of the public one (local runs)
@@ -43,10 +37,42 @@ def get_public_ip():
   print('My public IP address is: {}'.format(ipAddr))
   return ipAddr
 
+class ReusableSimpleXMLRPCServer(SimpleXMLRPCServer):
+  # The port can be bound again right after a restart, as with the old socket.
+  allow_reuse_address = True
+
+class PeerService:
+  def __init__(self):
+    self.myself = None
+    self.nMsgs = None
+
+  def start(self, peerNumber, nMsgs):
+    self.myself = int(peerNumber)
+    self.nMsgs = int(nMsgs)
+    # Leave the group before acknowledging termination. startPeers waits for
+    # this reply, and only then does the comparison server stop the group manager.
+    if self.nMsgs == 0:
+      unregisterFromGroupManager()
+    return 'Peer process ' + str(self.myself) + ' started.'
+
+# XML-RPC server for the comparison server's start signal. Peer messages stay on UDP.
+peerServer = ReusableSimpleXMLRPCServer(
+  ('0.0.0.0', PEER_TCP_PORT),
+  allow_none=True,
+  logRequests=False,
+)
+peerService = PeerService()
+peerServer.register_instance(peerService)
+
 def groupManagerProxy():
   # XML-RPC to the group manager. Messages between peers stay on UDP.
   return xmlrpc.client.ServerProxy(
     'http://%s:%s' % (GROUPMNGR_ADDR, GROUPMNGR_TCP_PORT),
+    allow_none=True)
+
+def comparisonProxy():
+  return xmlrpc.client.ServerProxy(
+    'http://%s:%s' % (SERVER_ADDR, SERVER_PORT),
     allow_none=True)
 
 # Register this peer with the group manager.
@@ -135,30 +161,17 @@ class MsgHandler(threading.Thread):
     logFile.writelines(str(logList))
     logFile.close()
     
-    # Send the list of messages to the server (using a TCP socket) for comparison
+    # Send the list of messages to the comparison server.
     print('Sending the list of messages to the server for comparison...')
-    clientSock = socket(AF_INET, SOCK_STREAM)
-    clientSock.connect((SERVER_ADDR, SERVER_PORT))
-    msgPack = pickle.dumps(logList)
-    clientSock.send(msgPack)
-    clientSock.close()
+    comparisonProxy().submitLog(logList)
 
     exit(0)
 
-# Function to wait for start signal from comparison server:
+# Function to wait for the start signal from the comparison server:
 def waitToStart():
-  (conn, addr) = serverSock.accept()
-  msgPack = conn.recv(1024)
-  msg = pickle.loads(msgPack)
-  myself = msg[0]
-  nMsgs = msg[1]
-  # Leave the group before acknowledging termination. startPeers waits for
-  # this reply, and only then does the comparison server stop the group manager.
-  if nMsgs == 0:
-    unregisterFromGroupManager()
-  conn.send(pickle.dumps('Peer process '+str(myself)+' started.'))
-  conn.close()
-  return (myself,nMsgs)
+  # One start() call. The XML-RPC response is sent before this returns.
+  peerServer.handle_request()
+  return (peerService.myself, peerService.nMsgs)
 
 # From here, code is executed when program starts:
 registerWithGroupManager()

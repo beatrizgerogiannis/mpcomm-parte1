@@ -160,15 +160,50 @@ comparison e peer continuam em socket TCP.
 - Não há dependência nova: `xmlrpc` já vem no `python:3.12-slim`. O `requirements.txt`
   não mudou.
 
+## Passo 4 — comparison e peer em XML-RPC
+
+Objetivo: trocar o TCP com `pickle` que ainda restava entre o comparison e cada peer.
+O comparison chama `start(peerNumber, nMsgs)` no peer. O peer devolve o log com
+`submitLog`. A comunicação entre peers continua em UDP. Não há socket TCP de
+aplicação nas interações cliente-servidor: GroupMngr, comparison e peer usam XML-RPC
+nas mesmas portas de antes (`5680`, `5678` e `5679`).
+
+### comparisonServer.py
+- **O que era:** `startPeers` abria um TCP, enviava `(peerNumber, nMsgs)` com `pickle`
+  e lia a confirmação com `recv(512)`. `waitForLogsAndCompare` aceitava N conexões e
+  lia cada log com `recv(32768)`.
+- **O que mudou:** `startPeers` chama `peerProxy(ip).start(peerNumber, nMsgs)` e imprime
+  a string devolvida (`Peer process <id> started.`). O comparison escuta em
+  `SERVER_PORT` com `SimpleXMLRPCServer` e o método `submitLog`. `waitForLogsAndCompare`
+  atende uma chamada por peer com `handle_request`. O socket já está em `listen` antes
+  de `startPeers`, então um peer que termina a rodada enquanto o comparison ainda
+  dispara os outros fica na fila. A fila é `max(N, 16)`.
+- **Tuplas:** XML-RPC não tem tupla. Cada mensagem `(remetente, sequência)` chega como
+  lista. `restore_log` reconstitui a tupla antes da comparação, e
+  `count_unordered_rounds` continua comparando tuplas.
+- **Por quê:** o `recv(32768)` cortava um log grande e o `pickle.loads` falhava. O
+  HTTP manda o tamanho do corpo; o log de uma rodada com `nMsgs` grande chega inteiro.
+
+### peerCommunicatorUDP.py
+- **O que mudou:** o socket TCP da porta `PEER_TCP_PORT` virou `PeerService.start`.
+  `waitToStart` atende uma chamada e só então segue a rodada; a resposta XML-RPC sai
+  antes disso. Com `nMsgs == 0`, o `unregister` continua acontecendo dentro de
+  `start`, antes da resposta. No fim da rodada, a thread que recebeu as mensagens UDP
+  chama `comparisonProxy().submitLog(logList)` em vez de abrir um TCP.
+- **Não mudou:** handshake, dados e mensagem de fim entre peers, em UDP e `pickle`.
+  O `recv(1024)` desses datagramas continua: cada um cabe numa mensagem UDP. O arquivo
+  `logfile<ID>.log` continua sendo escrito no peer antes do envio do log.
+
+### Testes
+- **`tests/test_comparison_rpc.py`:** uma lista vinda do XML-RPC vira tupla, e um log
+  de 3000 mensagens (6 peers × 500) atravessa o XML-RPC inteiro. O comando continua
+  `python3 -m unittest discover -s tests -v`.
+
 ## Problemas conhecidos ainda não corrigidos
 - **UDP sem confirmação/retransmissão e handshake não confiável:** um `READY` ou uma
   mensagem perdida trava o peer ou deixa o log incompleto. → Passo 5.
 - **Mensagens de dados recebidas durante o laço de handshake são descartadas
   silenciosamente:** um peer que termina o handshake antes começa a enviar dados, e quem
   ainda está no laço de handshake ignora tudo que não é `READY`. → Passo 5.
-- **`recv` de tamanho fixo no TCP entre comparison e peer** (`recv(512)` na confirmação
-  de início, `recv(1024)` no sinal de start, `recv(32768)` no log): mensagens maiores
-  chegam truncadas e o `pickle.loads` falha. O `recv(2048)` do GroupMngr saiu no Passo 3.
-- **`pickle` em rede é inseguro:** desserializar dados recebidos pela rede permite execução
-  de código arbitrário. Saiu do caminho do GroupMngr (XML-RPC). Continua no UDP entre
-  peers e no TCP entre comparison e peer.
+- **`pickle` no UDP entre peers é inseguro:** desserializar o datagrama permite execução
+  de código arbitrário. O caminho cliente-servidor não usa mais `pickle`.
