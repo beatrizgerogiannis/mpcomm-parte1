@@ -6,6 +6,8 @@ import time
 import pickle
 import os
 import traceback
+import xmlrpc.client
+from xmlrpc.server import SimpleXMLRPCServer
 from requests import get
 import netsim   # software-level network simulator (LOSS_RATE / DELAY_MS / JITTER_MS)
 
@@ -21,6 +23,7 @@ RETRANS_CHECK_INTERVAL = 0.05  # seconds
 ROUND_TIMEOUT = float(os.environ.get('ROUND_TIMEOUT_S', 120))
 
 PEERS = []
+myIpAddr = None
 
 # UDP sockets to send and receive data messages:
 # Create send socket
@@ -30,13 +33,6 @@ recvSocket = socket(AF_INET, SOCK_DGRAM)
 # Allow immediate reuse of the port after closing
 recvSocket.setsockopt(SOL_SOCKET, SO_REUSEADDR, 1)
 recvSocket.bind(('0.0.0.0', PEER_UDP_PORT))
-
-# TCP socket to receive start signal from the comparison server:
-serverSock = socket(AF_INET, SOCK_STREAM)
-# Allow immediate reuse of the port after closing
-serverSock.setsockopt(SOL_SOCKET, SO_REUSEADDR, 1)
-serverSock.bind(('0.0.0.0', PEER_TCP_PORT))
-serverSock.listen(1)
 
 
 def get_public_ip():
@@ -49,40 +45,78 @@ def get_public_ip():
   print('My public IP address is: {}'.format(ipAddr))
   return ipAddr
 
-# Function to register this peer with the group manager
+class ReusableSimpleXMLRPCServer(SimpleXMLRPCServer):
+  # The port can be bound again right after a restart, as with the old socket.
+  allow_reuse_address = True
+
+class PeerService:
+  def __init__(self):
+    self.myself = None
+    self.nMsgs = None
+
+  def start(self, peerNumber, nMsgs):
+    self.myself = int(peerNumber)
+    self.nMsgs = int(nMsgs)
+    # Leave the group before acknowledging termination. startPeers waits for
+    # this reply, and only then does the comparison server stop the group manager.
+    if self.nMsgs == 0:
+      unregisterFromGroupManager()
+    return 'Peer process ' + str(self.myself) + ' started.'
+
+# XML-RPC server for the comparison server's start signal. Peer messages stay on UDP.
+peerServer = ReusableSimpleXMLRPCServer(
+  ('0.0.0.0', PEER_TCP_PORT),
+  allow_none=True,
+  logRequests=False,
+)
+peerService = PeerService()
+peerServer.register_instance(peerService)
+
+def groupManagerProxy():
+  # XML-RPC to the group manager. Messages between peers stay on UDP.
+  return xmlrpc.client.ServerProxy(
+    'http://%s:%s' % (GROUPMNGR_ADDR, GROUPMNGR_TCP_PORT),
+    allow_none=True)
+
+def comparisonProxy():
+  return xmlrpc.client.ServerProxy(
+    'http://%s:%s' % (SERVER_ADDR, SERVER_PORT),
+    allow_none=True)
+
+# Register this peer with the group manager.
 def registerWithGroupManager():
+  global myIpAddr
   print ('Connecting to group manager: ', (GROUPMNGR_ADDR,GROUPMNGR_TCP_PORT))
-  # Retry: the group manager may not be up yet (e.g., when started by Docker Compose)
+  myIpAddr = get_public_ip()
+  req = {'ipaddr': myIpAddr, 'port': PEER_UDP_PORT}
+  print ('Registering with group manager: ', req)
+  # Retry: the group manager may not be up yet (e.g., when started by Docker Compose).
+  # A repeated register is safe: the server keeps a single entry per IP.
   for attempt in range(1, 21):
-    clientSock = socket(AF_INET, SOCK_STREAM)
     try:
-      clientSock.connect((GROUPMNGR_ADDR,GROUPMNGR_TCP_PORT))
+      groupManagerProxy().register(myIpAddr, PEER_UDP_PORT)
       break
-    except OSError as e:
-      clientSock.close()
+    except (OSError, xmlrpc.client.Error) as e:
       print('Group manager not available (attempt ' + str(attempt) + '/20): ', e)
       if attempt == 20:
         raise
       time.sleep(0.5)
-  ipAddr = get_public_ip()
-  req = {"op":"register", "ipaddr":ipAddr, "port":PEER_UDP_PORT}
-  msg = pickle.dumps(req)
-  print ('Registering with group manager: ', req)
-  clientSock.send(msg)
-  clientSock.close()
+
+def unregisterFromGroupManager():
+  if myIpAddr is None:
+    return
+  req = {'ipaddr': myIpAddr, 'port': PEER_UDP_PORT}
+  print ('Unregistering from group manager: ', req)
+  try:
+    groupManagerProxy().unregister(myIpAddr, PEER_UDP_PORT)
+  except (OSError, xmlrpc.client.Error) as e:
+    print('Could not unregister from group manager: ', e)
 
 def getListOfPeers():
-  clientSock = socket(AF_INET, SOCK_STREAM)
   print ('Connecting to group manager: ', (GROUPMNGR_ADDR,GROUPMNGR_TCP_PORT))
-  clientSock.connect((GROUPMNGR_ADDR,GROUPMNGR_TCP_PORT))
-  req = {"op":"list"}
-  msg = pickle.dumps(req)
-  print ('Getting list of peers from group manager: ', req)
-  clientSock.send(msg)
-  msg = clientSock.recv(2048)
-  PEERS = pickle.loads(msg)
+  print ('Getting list of peers from group manager')
+  PEERS = groupManagerProxy().list()
   print ('Got list of peers: ', PEERS)
-  clientSock.close()
   return PEERS
 
 # State of one round, shared by the main thread and the receiver thread (guarded by roundLock)
@@ -245,13 +279,9 @@ class Retransmitter(threading.Thread):
 
 # Body moved unchanged from the end of the old MsgHandler.run()
 def sendLog(logList):
-  # Send the list of messages to the server (using a TCP socket) for comparison
+  # The comparison server receives the log by RPC. The round logic above stays as on main.
   print('Sending the list of messages to the server for comparison...')
-  clientSock = socket(AF_INET, SOCK_STREAM)
-  clientSock.connect((SERVER_ADDR, SERVER_PORT))
-  msgPack = pickle.dumps(logList)
-  clientSock.send(msgPack)
-  clientSock.close()
+  comparisonProxy().submitLog(logList)
 
 # Describes what is missing in round r (called on timeout): READY, gaps per sender, END
 # Describes what is missing in round r (called on timeout): READY, gaps per sender, END, and the
@@ -274,16 +304,11 @@ def describeMissing(r):
   return ('missing READY from ' + str(missingReady) + '; gaps per sender ' + str(gaps) +
           '; missing END from ' + str(missingEnd) + '; held back per sender ' + str(heldBack))
 
-# Function to wait for start signal from comparison server:
+# Function to wait for the start signal from the comparison server:
 def waitToStart():
-  (conn, addr) = serverSock.accept()
-  msgPack = conn.recv(1024)
-  msg = pickle.loads(msgPack)
-  myself = msg[0]
-  nMsgs = msg[1]
-  conn.send(pickle.dumps('Peer process '+str(myself)+' started.'))
-  conn.close()
-  return (myself,nMsgs)
+  # One start() call. The XML-RPC response is sent before this returns.
+  peerServer.handle_request()
+  return (peerService.myself, peerService.nMsgs)
 
 # From here, code is executed when program starts:
 registerWithGroupManager()

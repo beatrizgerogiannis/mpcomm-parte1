@@ -24,6 +24,42 @@ docker compose down
 Para outro número de peers: `N_PEERS=8 AUTO_ROUNDS=20 docker compose up --build --exit-code-from comparison`.
 Em rede local o número de "unordered message rounds" costuma ser 0 ou baixo; isso é esperado.
 
+## Sockets e XML-RPC
+
+As interações cliente-servidor (GroupMngr, sinal de início e envio do log) usam XML-RPC da biblioteca padrão. O multicast entre peers continua em UDP. A comparação abaixo é com a tag `sockets-baseline`.
+
+O `peerCommunicatorUDP.py` inteiro passou de 201 para 395 linhas. A maior parte desse aumento é a entrega confiável e o FIFO, que não entram nesta comparação. Os números de linhas abaixo cobrem só o cliente-servidor: o `GroupMngr.py` inteiro, o `comparisonServer.py` sem as 65 linhas de `check_fifo_and_completeness`, e no peer o trecho que registra, lista, recebe o início da rodada e devolve o log.
+
+| | `sockets-baseline` | XML-RPC |
+|---|---:|---:|
+| Linhas, GroupMngr.py | 39 | 104 |
+| Linhas, comparisonServer.py sem a checagem FIFO | 142 | 170 |
+| Linhas, trecho cliente-servidor do peer | 57 | 81 |
+| `register` | 64 B | 210 B |
+| resposta de `list` com 6 IPs | 94 B | 396 B |
+| `start(0, 20)` | 18 B | 190 B |
+| log de 120 mensagens (6×20) | 736 B | 12 415 B |
+| log de 3000 mensagens (6×500) | 20 764 B | 311 055 B |
+| serializar o log de 3000, nesta máquina | 0,22 ms | 3,26 ms |
+| ida e volta local do log de 3000 | 0,16 ms | 21,8 ms |
+
+Os tamanhos do lado socket são o `pickle` da mensagem. Os do XML-RPC são o XML do pedido ou da resposta, com o nome do método. A ida e volta do socket leu o `pickle` inteiro; a do XML-RPC foi uma chamada `submitLog` de verdade, com as 3000 mensagens entregues.
+
+**Vantagens do XML-RPC neste código**
+
+- O corpo HTTP traz o tamanho. Some o `recv` de tamanho fixo (`2048` no GroupMngr, `512` na confirmação, `1024` no início, `32768` no log). Um `recv(32768)` também só funciona se o TCP entregar a mensagem inteira numa leitura. O `pickle` de 3000 mensagens tem 20 764 B e ainda cabe nesse buffer; o estouro medido fica por volta de 4800 mensagens no log (cerca de `nMsgs=800` com 6 peers). A rodada Docker com `nMsgs=500` entregou 3000 mensagens em cada peer.
+- `register` devolve confirmação e é idempotente por IP. Reiniciar um peer não cria outra entrada: o GroupMngr registrou os 6, o reinício do mesmo contêiner gerou `Peer already registered` e `list()` continuou com 6 IPs distintos.
+- `unregister` existe e também é idempotente. No baseline era `pass`.
+- Falha de método vira `xmlrpc.client.Fault` ou `ProtocolError`, além de `OSError` quando a conexão não abre. O peer repete o `register` nesses dois casos.
+
+**Desvantagens**
+
+- A mensagem fica maior: cerca de 3 a 4 vezes no `register` e no `list`, 10 vezes no `start`, 15 a 17 vezes no log. O log de 3000 mensagens sai de 20 KB para 311 KB.
+- A chamada é mais lenta. Na mesma máquina, a ida e volta desse log passou de 0,16 ms para 21,8 ms. No experimento isso fica pequeno perto da espera aleatória de 10 a 100 ms entre mensagens UDP.
+- XML-RPC não tem tupla. O log chega como lista de listas e `restore_log` reconstitui `(remetente, sequência)` antes da comparação.
+- O servidor atende uma chamada por vez. O comparison precisa de fila (`max(N, 16)`) para os logs que chegam juntos.
+- Os dois lados continuam acoplados pelo nome dos métodos e pela porta em `constMP.py`. O que saiu foi o acordo implícito sobre as chaves do dicionário `op` e sobre o tamanho de cada `recv`.
+
 Very simple demo of multicast communication without coordination. The intent is to demonstrate how things can go wrong as we scale a distributed system (in this case, scaling in the geographical dimension) without taking appropriate measures to coordinate the behavior of its components. Later, this example will serve as the basis to implement coordination protocols, notably for message ordering, as part of course assignments.
 
 ## Overall structure

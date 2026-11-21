@@ -1,5 +1,5 @@
-from socket import *
-import pickle
+from xmlrpc.server import SimpleXMLRPCServer
+import xmlrpc.client
 from constMP import *
 import time
 import sys
@@ -13,18 +13,38 @@ if os.environ.get('AUTO_ROUNDS', '').strip():
 	if any(n <= 0 for n in autoRounds):
 		sys.exit('ERROR: AUTO_ROUNDS must contain only positive integers (e.g., "20" or "20,50")')
 
+class ReusableSimpleXMLRPCServer(SimpleXMLRPCServer):
+	# The port can be bound again right after a restart, as with the old socket.
+	allow_reuse_address = True
+
+def groupManagerProxy():
+	return xmlrpc.client.ServerProxy(
+		'http://%s:%s' % (GROUPMNGR_ADDR, GROUPMNGR_TCP_PORT),
+		allow_none=True)
+
+def peerProxy(peer):
+	return xmlrpc.client.ServerProxy(
+		'http://%s:%s' % (peer, PEER_TCP_PORT),
+		allow_none=True)
+
+def restore_log(log):
+	# XML-RPC has no tuples: each (sender, seq) arrives as a list.
+	return [tuple(msg) for msg in log]
+
+class ComparisonService:
+	def __init__(self):
+		self.logs = []
+
+	def submitLog(self, log):
+		self.logs.append(restore_log(log))
+		print('Received log from peer')
+		return True
+
 def mainLoop():
 	cont = 1
 	while 1:
 		nMsgs = promptUser()
-		clientSock = socket(AF_INET, SOCK_STREAM)
-		clientSock.connect((GROUPMNGR_ADDR,GROUPMNGR_TCP_PORT))
-		req = {"op":"list"}
-		msg = pickle.dumps(req)
-		clientSock.send(msg)
-		msg = clientSock.recv(2048)
-		clientSock.close()
-		peerList = pickle.loads(msg)
+		peerList = groupManagerProxy().list()
 		print("List of Peers: ", peerList)
 		startPeers(peerList,nMsgs)
 		if nMsgs != 0:
@@ -32,15 +52,13 @@ def mainLoop():
 			waitForLogsAndCompare(nMsgs)
 		else:
 			print('Stopping.')
-			serverSock.close()
-			
+			server.server_close()
+
 			# Tell group manager to stop
-			cSock = socket(AF_INET, SOCK_STREAM)
-			cSock.connect((GROUPMNGR_ADDR,GROUPMNGR_TCP_PORT))
-			req = {"op":"stop"}
-			msg = pickle.dumps(req)
-			cSock.send(msg)
-			cSock.close()
+			try:
+				groupManagerProxy().stop()
+			except (OSError, xmlrpc.client.Error) as e:
+				print('Group manager stop: ', e)
 			break
 
 def promptUser():
@@ -61,15 +79,10 @@ def waitForPeers(timeout=60):
 	deadline = time.time() + timeout
 	peerList = []
 	while True:
-		clientSock = socket(AF_INET, SOCK_STREAM)
 		try:
-			clientSock.connect((GROUPMNGR_ADDR,GROUPMNGR_TCP_PORT))
-			clientSock.send(pickle.dumps({"op":"list"}))
-			peerList = pickle.loads(clientSock.recv(2048))
-		except (OSError, EOFError) as e:
+			peerList = groupManagerProxy().list()
+		except (OSError, xmlrpc.client.Error) as e:
 			print('Group manager not available: ', e)
-		finally:
-			clientSock.close()
 		if len(peerList) >= N:
 			return
 		if time.time() >= deadline:
@@ -78,32 +91,19 @@ def waitForPeers(timeout=60):
 		time.sleep(0.5)
 
 def startPeers(peerList,nMsgs):
-	# Connect to each of the peers and send the 'initiate' signal:
+	# Tell each peer its id and how many messages to send.
 	peerNumber = 0
 	for peer in peerList:
-		clientSock = socket(AF_INET, SOCK_STREAM)
-		clientSock.connect((peer, PEER_TCP_PORT))
-		msg = (peerNumber,nMsgs)
-		msgPack = pickle.dumps(msg)
-		clientSock.send(msgPack)
-		msgPack = clientSock.recv(512)
-		print(pickle.loads(msgPack))
-		clientSock.close()
+		print(peerProxy(peer).start(peerNumber, nMsgs))
 		peerNumber = peerNumber + 1
 
 def waitForLogsAndCompare(N_MSGS):
-	# Loop to wait for the message logs for comparison:
-	numPeers = 0
-	msgs = [] # each msg is a list of tuples (with the original messages received by the peer processes)
-
-	# Receive the logs of messages from the peer processes
-	while numPeers < N:
-		(conn, addr) = serverSock.accept()
-		msgPack = conn.recv(32768)
-		print ('Received log from peer')
-		conn.close()
-		msgs.append(pickle.loads(msgPack))
-		numPeers = numPeers + 1
+	# One submitLog call per peer. The listening socket is already open, so a
+	# peer that finishes during startPeers queues until handle_request runs.
+	comparisonService.logs = []
+	while len(comparisonService.logs) < N:
+		server.handle_request()
+	msgs = comparisonService.logs
 
 	# Check log sizes: each peer should have received N_MSGS messages from each of the N peers
 	expected = N * N_MSGS
@@ -217,11 +217,19 @@ def count_unordered_rounds(logs):
 
 
 if __name__ == "__main__":
-	serverSock = socket(AF_INET, SOCK_STREAM)
-	# Allow immediate reuse of the port after closing
-	serverSock.setsockopt(SOL_SOCKET, SO_REUSEADDR, 1)
-	serverSock.bind(('0.0.0.0', SERVER_PORT))
-	serverSock.listen(6)
+	server = ReusableSimpleXMLRPCServer(
+		('0.0.0.0', SERVER_PORT),
+		allow_none=True,
+		logRequests=False,
+		bind_and_activate=False,
+	)
+	# Peers submit logs at nearly the same time. The queue has to hold every
+	# connection until this process calls handle_request.
+	server.request_queue_size = max(N, 16)
+	server.server_bind()
+	server.server_activate()
+	comparisonService = ComparisonService()
+	server.register_instance(comparisonService)
 
 	# Initiate server:
 	mainLoop()

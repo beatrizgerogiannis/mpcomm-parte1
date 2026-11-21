@@ -110,6 +110,95 @@ Correções de bugs do código original que atrapalham a Parte 1. O protocolo de
     Rodar o script continua igual.
 - **Testes:** `tests/test_compare.py` (unittest): `python3 -m unittest discover -s tests -v`.
 
+## Passo 3 — GroupMngr em XML-RPC
+
+Objetivo: trocar o TCP com `pickle` entre o GroupMngr e seus clientes (peer e comparison)
+por XML-RPC da biblioteca padrão, na mesma porta (`GROUPMNGR_TCP_PORT`, 5680). A
+comunicação entre peers continua em UDP. O sinal de início e o envio dos logs entre
+comparison e peer continuam em socket TCP.
+
+### GroupMngr.py
+- **O que era:** socket TCP, `recv(2048)`, `pickle` e despacho por `{"op": ...}`.
+  `register` sempre fazia `append`. `unregister` era `pass`.
+- **O que mudou:** `SimpleXMLRPCServer` com os métodos `register`, `list`, `unregister` e
+  `stop`. A lógica de associação está nas funções puras `register_peer`, `unregister_peer`
+  e `list_peer_ips`. O servidor reutiliza a porta (`allow_reuse_address`) e atende um
+  pedido por vez (`handle_request`), como o `accept` anterior. `stop` só marca o fim do
+  laço; a resposta dessa chamada é enviada antes de o processo sair. O `serverLoop()`
+  ficou dentro de `if __name__ == "__main__":`, para os testes importarem o módulo sem
+  abrir a porta.
+- **`register` sem duplicata:** a identidade é o IP. O mesmo IP e a mesma porta deixam a
+  lista como está. O mesmo IP com outra porta substitui a porta, e `list()` continua
+  devolvendo esse IP uma vez. Um peer que reinicia não aparece duas vezes.
+- **`unregister(ip, porta)`:** remove esse par. Um par que já não está na lista não é
+  erro. A porta faz parte da chave, então um `unregister` atrasado de um processo antigo
+  não apaga um peer que já se registrou de novo com outra porta.
+- **Por quê:** tira o tamanho fixo de `recv` e o `pickle` desse caminho, e corrige o
+  registro duplicado.
+
+### peerCommunicatorUDP.py
+- **O que mudou:** `registerWithGroupManager()` e `getListOfPeers()` usam
+  `xmlrpc.client.ServerProxy`. As 20 tentativas continuam, agora em volta de `register()`,
+  capturando `OSError` e `xmlrpc.client.Error`. Repetir o `register` é seguro: o servidor
+  mantém uma entrada por IP. Ao receber `nMsgs == 0`, o peer chama `unregister` antes de
+  responder ao comparison, para o `stop` do GroupMngr ocorrer depois da saída do grupo.
+- **Não mudou:** handshake, dados e mensagem de fim entre peers (UDP). O TCP que recebe
+  o sinal de início e envia o log ao comparison.
+
+### comparisonServer.py
+- **O que mudou:** a lista de peers (no laço principal e em `waitForPeers`) e o `stop`
+  passam pelo proxy XML-RPC. Uma falha em `stop` é impressa e o comparison ainda encerra,
+  porque nesse modo o objetivo é sair.
+- **Não mudou:** `startPeers` e a recepção dos logs, que seguem em TCP e `pickle`.
+  `AUTO_ROUNDS` continua terminando sem enviar `nMsgs=0` e sem chamar `stop`.
+
+### Testes
+- **`tests/test_groupmngr.py`:** `register` idempotente, troca de porta sem segunda
+  entrada, `unregister` de par existente e de par ausente, e a mesma sequência por
+  XML-RPC, inclusive o `stop`. O comando continua
+  `python3 -m unittest discover -s tests -v`.
+- Não há dependência nova: `xmlrpc` já vem no `python:3.12-slim`. O `requirements.txt`
+  não mudou.
+
+## Passo 4 — comparison e peer em XML-RPC
+
+Objetivo: trocar o TCP com `pickle` que ainda restava entre o comparison e cada peer.
+O comparison chama `start(peerNumber, nMsgs)` no peer. O peer devolve o log com
+`submitLog`. A comunicação entre peers continua em UDP. Não há socket TCP de
+aplicação nas interações cliente-servidor: GroupMngr, comparison e peer usam XML-RPC
+nas mesmas portas de antes (`5680`, `5678` e `5679`).
+
+### comparisonServer.py
+- **O que era:** `startPeers` abria um TCP, enviava `(peerNumber, nMsgs)` com `pickle`
+  e lia a confirmação com `recv(512)`. `waitForLogsAndCompare` aceitava N conexões e
+  lia cada log com `recv(32768)`.
+- **O que mudou:** `startPeers` chama `peerProxy(ip).start(peerNumber, nMsgs)` e imprime
+  a string devolvida (`Peer process <id> started.`). O comparison escuta em
+  `SERVER_PORT` com `SimpleXMLRPCServer` e o método `submitLog`. `waitForLogsAndCompare`
+  atende uma chamada por peer com `handle_request`. O socket já está em `listen` antes
+  de `startPeers`, então um peer que termina a rodada enquanto o comparison ainda
+  dispara os outros fica na fila. A fila é `max(N, 16)`.
+- **Tuplas:** XML-RPC não tem tupla. Cada mensagem `(remetente, sequência)` chega como
+  lista. `restore_log` reconstitui a tupla antes da comparação, e
+  `count_unordered_rounds` continua comparando tuplas.
+- **Por quê:** o `recv(32768)` cortava um log grande e o `pickle.loads` falhava. O
+  HTTP manda o tamanho do corpo; o log de uma rodada com `nMsgs` grande chega inteiro.
+
+### peerCommunicatorUDP.py
+- **O que mudou:** o socket TCP da porta `PEER_TCP_PORT` virou `PeerService.start`.
+  `waitToStart` atende uma chamada e só então segue a rodada; a resposta XML-RPC sai
+  antes disso. Com `nMsgs == 0`, o `unregister` continua acontecendo dentro de
+  `start`, antes da resposta. No fim da rodada, a thread que recebeu as mensagens UDP
+  chama `comparisonProxy().submitLog(logList)` em vez de abrir um TCP.
+- **Não mudou:** handshake, dados e mensagem de fim entre peers, em UDP e `pickle`.
+  O `recv(1024)` desses datagramas continua: cada um cabe numa mensagem UDP. O arquivo
+  `logfile<ID>.log` continua sendo escrito no peer antes do envio do log.
+
+### Testes
+- **`tests/test_comparison_rpc.py`:** uma lista vinda do XML-RPC vira tupla, e um log
+  de 3000 mensagens (6 peers × 500) atravessa o XML-RPC inteiro. O comando continua
+  `python3 -m unittest discover -s tests -v`.
+
 ## Passo 5 — Entrega confiável entre peers (1b: perda de mensagens)
 
 Objetivo: entrega sem perdas e sem duplicatas no multicast UDP entre peers. A ordem
@@ -300,3 +389,4 @@ das mensagens, ACK, regra de rodadas) não mudou; só foram extraídas funções
   registrado de novo e peers que saem nunca são removidos. → Passo 3.
 - **`pickle` em rede é inseguro:** desserializar dados recebidos pela rede permite execução
   de código arbitrário. Mantido por compatibilidade; apenas documentado.
+
